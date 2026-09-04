@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+#
+# Copyright 2026 Max Brito
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""Render an equirectangular world map with the current day/night terminator.
+
+Unlike the wallpaper renderer in the sibling `globewallpaper` project, this
+writes a plain 2:1 equirectangular image with no framing and does not touch
+the desktop background. The GNOME Shell extension wraps the result around a
+sphere in a fragment shader, so it must stay an untouched lon/lat map.
+
+If globewallpaper has already downloaded the NASA source imagery, this reuses
+its cache instead of fetching the same files a second time.
+"""
+
+import os
+import sys
+import urllib.request
+from datetime import datetime, timezone
+
+import numpy as np
+from PIL import Image
+
+# --- tunables ---------------------------------------------------------------
+
+DATA_DIR = os.path.expanduser("~/.local/share/globeswitcher")
+TEXTURE_DIR = os.path.join(DATA_DIR, "textures")
+OUTPUT = os.path.join(DATA_DIR, "globe-equirect.png")
+
+# Cache of the sibling project; reused when present so the ~3.3 MB of NASA
+# imagery is only ever downloaded once per machine.
+SHARED_TEXTURE_DIR = os.path.expanduser(
+    "~/.local/share/daynight-wallpaper/textures")
+
+DAY_URL = ("https://eoimages.gsfc.nasa.gov/images/imagerecords/73000/73909/"
+           "world.topo.bathy.200412.3x5400x2700.jpg")
+NIGHT_URL = ("https://eoimages.gsfc.nasa.gov/images/imagerecords/144000/144898/"
+             "BlackMarble_2016_01deg.jpg")
+
+MAP_SIZE = (2048, 1024)
+
+# Solar elevation (degrees) over which day fades into night.
+TWILIGHT_LO = -12.0
+TWILIGHT_HI = 6.0
+
+DOWNLOAD_TIMEOUT = 120
+
+# --- textures ---------------------------------------------------------------
+
+
+def download(url, dest):
+    tmp = dest + ".part"
+    req = urllib.request.Request(url, headers={"User-Agent": "globeswitcher"})
+    with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp, \
+            open(tmp, "wb") as fh:
+        while chunk := resp.read(262144):
+            fh.write(chunk)
+    os.replace(tmp, dest)
+
+
+def source_image(name, url):
+    """Path to the full-size NASA source, downloading it only if needed."""
+    shared = os.path.join(SHARED_TEXTURE_DIR, f"{name}_original.jpg")
+    if os.path.exists(shared):
+        return shared
+
+    local = os.path.join(TEXTURE_DIR, f"{name}_original.jpg")
+    if not os.path.exists(local):
+        print(f"downloading {name} texture...", file=sys.stderr)
+        download(url, local)
+    return local
+
+
+def texture(name, url, size):
+    """The texture resized to `size` as a float32 HxWx3 array."""
+    cache = os.path.join(TEXTURE_DIR, f"{name}_{size[0]}x{size[1]}.png")
+    if not os.path.exists(cache):
+        Image.MAX_IMAGE_PIXELS = None
+        img = Image.open(source_image(name, url)).convert("RGB")
+        img = img.resize(size, Image.LANCZOS)
+        tmp = cache + ".tmp.png"
+        img.save(tmp)
+        os.replace(tmp, cache)
+    return np.asarray(Image.open(cache).convert("RGB"), dtype=np.float32)
+
+
+# --- solar geometry ---------------------------------------------------------
+
+
+def subsolar_point(when):
+    """Latitude/longitude (degrees) where the sun is directly overhead.
+
+    Low-precision formulas from the Astronomical Almanac: the error is well
+    under 0.1 degrees, far finer than this map can show.
+    """
+    jd = when.timestamp() / 86400.0 + 2440587.5
+    n = jd - 2451545.0                                      # days since J2000
+
+    g = np.radians((357.528 + 0.9856003 * n) % 360.0)       # mean anomaly
+    q = (280.459 + 0.98564736 * n) % 360.0                  # mean longitude
+    lam = np.radians((q + 1.915 * np.sin(g) + 0.020 * np.sin(2 * g)) % 360.0)
+    eps = np.radians(23.439 - 0.00000036 * n)               # obliquity
+
+    dec = np.degrees(np.arcsin(np.sin(eps) * np.sin(lam)))
+
+    ra = np.degrees(np.arctan2(np.cos(eps) * np.sin(lam), np.cos(lam))) % 360.0
+    eot_min = ((q - ra + 180.0) % 360.0 - 180.0) * 4.0      # equation of time
+
+    utc_hours = (when.hour + when.minute / 60.0 + when.second / 3600.0
+                 + when.microsecond / 3.6e9)
+    lon = -15.0 * (utc_hours + eot_min / 60.0 - 12.0)
+    return dec, (lon + 180.0) % 360.0 - 180.0
+
+
+def daylight_alpha(shape, when):
+    """HxW array: 1.0 full daylight, 0.0 full night, smooth across twilight."""
+    h, w = shape
+    dec, lon_s = subsolar_point(when)
+
+    lat = np.radians(90.0 - (np.arange(h) + 0.5) * (180.0 / h))
+    lon = np.radians((np.arange(w) + 0.5) * (360.0 / w) - 180.0)
+    dec_r = np.radians(dec)
+    ha = lon - np.radians(lon_s)
+
+    cos_zenith = (np.sin(lat)[:, None] * np.sin(dec_r)
+                  + np.cos(lat)[:, None] * np.cos(dec_r) * np.cos(ha)[None, :])
+    elev = np.degrees(np.arcsin(np.clip(cos_zenith, -1.0, 1.0)))
+
+    t = np.clip((elev - TWILIGHT_LO) / (TWILIGHT_HI - TWILIGHT_LO), 0.0, 1.0)
+    return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+
+
+# --- main -------------------------------------------------------------------
+
+
+def render(when, size=MAP_SIZE):
+    day = texture("day", DAY_URL, size)
+    night = texture("night", NIGHT_URL, size)
+    alpha = daylight_alpha((size[1], size[0]), when)[:, :, None]
+    blended = day * alpha + night * (1.0 - alpha)
+    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
+
+
+def main():
+    os.makedirs(TEXTURE_DIR, exist_ok=True)
+
+    fake = os.environ.get("GLOBE_FAKE_UTC")          # test hook
+    when = (datetime.fromisoformat(fake).replace(tzinfo=timezone.utc) if fake
+            else datetime.now(timezone.utc))
+
+    out = os.environ.get("GLOBE_OUTPUT", OUTPUT)
+    image = render(when)
+
+    tmp = out + ".tmp.png"
+    image.save(tmp)
+    os.replace(tmp, out)                             # atomic for the reader
+    print(out)
+
+
+if __name__ == "__main__":
+    main()
