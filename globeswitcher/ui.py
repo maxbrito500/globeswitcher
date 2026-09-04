@@ -37,14 +37,21 @@ from .globe import VIEW_TILT_RADIANS
 
 # Layout, as fractions of the screen's short axis.
 GLOBE_FRACTION = 0.50
-ITEM_FRACTION = 0.145
-ITEM_MIN = 84
-ITEM_MAX = 190
+ITEM_FRACTION = 0.29
+ITEM_MIN = 168
+ITEM_MAX = 380
 
 # The ring the windows ride on, in globe radii. Wide enough that
 # ORBIT_RADIUS * sin(view tilt) is about 1, which puts the window at the front
 # on the globe's lower rim rather than across its face.
 ORBIT_RADIUS = 2.40
+
+# How far the ring floats above the equatorial plane, in globe radii. A ring
+# lying exactly on the equator projects far below the globe's centre -- the
+# camera tilt multiplies the offset by the ring's radius -- and the windows end
+# up sweeping past the south pole. Lifting the ring slides the whole ellipse
+# back up, so it crosses just below the equator where it belongs.
+ORBIT_LIFT = 0.36
 
 # The gap between neighbouring windows on the ring. Fixed rather than
 # 360/n, so a handful of windows sit together as a band across the equator
@@ -119,6 +126,48 @@ def blend(canvas, rgb, alpha, x, y):
     target[:] = delta.astype(np.uint8)
 
 
+def copy_rect(canvas, rgb, x, y):
+    """Drop an opaque block into `canvas` at (x, y), clipped to it."""
+    height, width = rgb.shape[:2]
+    canvas_height, canvas_width = canvas.shape[:2]
+
+    sx, sy = max(0, -x), max(0, -y)
+    ex = min(width, canvas_width - x)
+    ey = min(height, canvas_height - y)
+    if ex <= sx or ey <= sy:
+        return
+
+    canvas[y + sy:y + ey, x + sx:x + ex] = rgb[sy:ey, sx:ex]
+
+
+def opaque_inset(alpha, limit_fraction=0.34):
+    """The smallest border width outside which every pixel is solid.
+
+    Window tiles are rounded rectangles: only the corners and the hairline
+    edge are partly transparent, and everything inside is opaque. Copying that
+    interior instead of alpha-blending it is most of the cost of drawing a
+    tile, and at these sizes the tiles are the most expensive thing in a frame.
+
+    Returns None when no such border exists, as for a bare application icon.
+    """
+    height, width = alpha.shape
+    limit = int(min(height, width) * limit_fraction)
+    if limit < 1:
+        return None
+
+    # The property is monotone in the inset, so binary search finds the edge.
+    low, high, found = 0, limit, None
+    while low <= high:
+        middle = (low + high) // 2
+        block = alpha[middle:height - middle, middle:width - middle]
+        if block.size and block.min() == 255:
+            found = middle
+            high = middle - 1
+        else:
+            low = middle + 1
+    return found
+
+
 def split_rgba(image):
     """A PIL RGBA image as (contiguous RGB array, contiguous alpha array)."""
     data = np.asarray(image, dtype=np.uint8)
@@ -162,9 +211,26 @@ class Layout:
         self.item_size = int(min(ITEM_MAX, max(
             ITEM_MIN, short * ITEM_FRACTION * crowding)))
 
-        # How far above and below the centre the ring reaches on screen.
-        self.orbit_rise = (ORBIT_RADIUS * math.sin(VIEW_TILT_RADIANS)
-                           * self.globe_radius)
+        # How far below the centre the near side of the ring reaches. The far
+        # side's height depends on how far round the windows actually go, so
+        # it is worked out from the span rather than assumed to be the whole
+        # ring; see `orbit_top`.
+        tilt = VIEW_TILT_RADIANS
+        self.orbit_rise = ((ORBIT_RADIUS * math.sin(tilt)
+                            - ORBIT_LIFT * math.cos(tilt)) * self.globe_radius)
+
+    @property
+    def orbit_top(self):
+        """How far above the centre the furthest window can reach.
+
+        Reserving the whole ring's height would leave a band of the screen
+        being repainted for windows that are never there: with a handful of
+        them the ring is an arc, not a circle.
+        """
+        tilt = VIEW_TILT_RADIANS
+        highest = (math.cos(tilt) * ORBIT_LIFT
+                   - math.sin(tilt) * ORBIT_RADIUS * math.cos(self.span))
+        return highest * self.globe_radius
 
     @property
     def max_item_size(self):
@@ -211,8 +277,7 @@ class Layout:
         # ring itself narrow, or a long title would be cut off at the edge.
         half_width = max(half_width, self.width * 0.32)
 
-        highest = self.orbit_rise * math.cos(span)      # negative past 90
-        top = cy - max(self.globe_radius, reach - highest)
+        top = cy - max(self.globe_radius, reach + max(0.0, self.orbit_top))
         bottom = max(cy + self.globe_radius,
                      cy + self.orbit_rise + reach,
                      self.title_top + self.title_height)
@@ -255,10 +320,11 @@ class Layout:
             mz = ORBIT_RADIUS * math.cos(lon)
 
             # The same camera as the globe: lifted above the equator looking
-            # down, so the near side of the ring hangs below the centre. The
-            # beads sit on the equator, so the world y term is zero.
-            ny = -sin_t * mz
-            nz = cos_t * mz
+            # down, so the near side of the ring hangs below the centre.
+            # ORBIT_LIFT raises the ring's plane, which on screen is a plain
+            # upward shift of the whole ellipse.
+            ny = cos_t * ORBIT_LIFT - sin_t * mz
+            nz = sin_t * ORBIT_LIFT + cos_t * mz
 
             depth = nz
             height = int(self.item_size *
@@ -344,12 +410,13 @@ class TileFactory:
         self._cache = {}
 
     def get(self, index, height):
-        """(RGB, alpha) for window `index`, drawn `height` pixels tall."""
+        """(RGB, alpha, opaque inset) for window `index`, at `height` tall."""
         height = max(16, int(round(height / self.QUANTUM)) * self.QUANTUM)
         key = (index, height)
         tile = self._cache.get(key)
         if tile is None:
-            tile = split_rgba(self._build(index, height))
+            rgb, alpha = split_rgba(self._build(index, height))
+            tile = (rgb, alpha, opaque_inset(alpha))
             self._cache[key] = tile
         return tile
 
@@ -441,7 +508,7 @@ class Frame:
         return canvas, left, top
 
     def _draw_bead(self, canvas, bead, selected, left, top):
-        rgb, alpha = self.tiles.get(bead.index, bead.height)
+        rgb, alpha, inset = self.tiles.get(bead.index, bead.height)
         height, width = rgb.shape[:2]
         x = bead.x - width // 2 - left
         y = bead.y - height // 2 - top
@@ -451,10 +518,23 @@ class Frame:
             blend(canvas, glow_rgb, glow_alpha, x - pad, y - pad)
 
         if bead.opacity < 1.0:
-            alpha = (alpha.astype(np.uint16) *
+            faded = (alpha.astype(np.uint16) *
                      int(bead.opacity * 256) >> 8).astype(np.uint8)
+            blend(canvas, rgb, faded, x, y)
+            return
 
-        blend(canvas, rgb, alpha, x, y)
+        if not inset:
+            blend(canvas, rgb, alpha, x, y)
+            return
+
+        # Solid middle straight in, and only the soft border blended.
+        k = inset
+        copy_rect(canvas, rgb[k:height - k, k:width - k], x + k, y + k)
+        blend(canvas, rgb[:k], alpha[:k], x, y)
+        blend(canvas, rgb[height - k:], alpha[height - k:], x, y + height - k)
+        blend(canvas, rgb[k:height - k, :k], alpha[k:height - k, :k], x, y + k)
+        blend(canvas, rgb[k:height - k, width - k:],
+              alpha[k:height - k, width - k:], x + width - k, y + k)
 
     def _highlight(self, width, height):
         """A soft halo behind the window at the front, cached per size."""

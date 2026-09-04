@@ -98,6 +98,13 @@ keeps the ring a shallow band around the waist rather than an arc over the
 poles. From its depth come two more things: windows nearer the viewer are
 drawn larger, and the ones swinging round the back are dimmed.
 
+The ring also floats a little above the equatorial plane. A ring lying exactly
+on the equator projects much further below the globe's centre than the equator
+itself does — the camera tilt multiplies the offset by the ring's radius, not
+the globe's — so the windows end up sweeping past the south pole. Lifting the
+ring slides the whole ellipse back up, and on screen that is simply a vertical
+shift, so it costs nothing.
+
 The spacing is a fixed angle rather than `360°/n`. Dividing the circle would
 fling four windows out to the four cardinal points and leave the globe ringed
 by empty space; a fixed step keeps a handful of windows together in front of
@@ -143,13 +150,26 @@ its ring. That rectangle is worked out once from the geometry, the dimmed
 desktop under it is prepared once, and each frame redraws and pushes only
 that.
 
-Three things make 60 frames a second reachable in Python. The globe's rotation
-is a whole-column shift of the map, so a frame is an integer add and one
-`numpy.take` rather than any floating-point work. Compositing is 32-bit
-integer arithmetic straight into numpy arrays, never through PIL images. And
-the finished frame is written into a **MIT-SHM** buffer the X server already
-has mapped, so handing it over costs nothing instead of pushing four megabytes
-down a socket — that alone took a frame from 21 ms to 17 ms.
+Four things make 60 frames a second reachable in Python.
+
+The globe's rotation is a whole-column shift of the map, so a frame is an
+integer add and one `numpy.take` rather than any floating-point work. A row of
+black is appended to the map and every pixel outside the disc points at it, so
+that gather writes the finished sphere directly into its buffer with no
+separate scatter and no mask.
+
+Compositing is 32-bit integer arithmetic straight into numpy arrays, never
+through PIL images. A window tile is a rounded rectangle, so only its corners
+and hairline edge are partly transparent; the solid middle — about 95% of it —
+is copied rather than blended, which at these tile sizes is most of the cost
+of drawing one.
+
+Only the rectangle the switcher can actually draw in is repainted, and it is
+derived from the arc the windows can reach rather than from the whole ring.
+
+And the finished frame is written into a **MIT-SHM** buffer the X server
+already has mapped, so handing it over costs nothing instead of pushing four
+megabytes down a socket.
 
 When the roll settles, drawing stops entirely and the daemon goes back to
 blocking on X input.
@@ -168,16 +188,23 @@ Constants at the top of the source:
 | `globeswitcher/globe.py` | `MAX_TEXTURE_AGE_SECONDS` | How stale the map may get before a refresh |
 | `globeswitcher/ui.py` | `GLOBE_FRACTION` | Globe diameter, as a share of the screen's short axis |
 | `globeswitcher/ui.py` | `ORBIT_RADIUS` | Ring radius, in globe radii |
+| `globeswitcher/ui.py` | `ORBIT_LIFT` | How far the ring floats above the equatorial plane |
 | `globeswitcher/ui.py` | `ANGULAR_STEP` | Angle between neighbouring windows |
+| `globeswitcher/ui.py` | `ITEM_FRACTION` | Window tile size, as a share of the screen's short axis |
 | `globeswitcher/ui.py` | `DEPTH_SCALE` | How much nearer windows grow |
 | `globeswitcher/ui.py` | `BACK_OPACITY` | Dimming of windows on the far side |
 | `globeswitcher/ui.py` | `BACKDROP_DIM` | How much of the desktop's brightness remains |
 | `globeswitcher/ui.py` | `BADGE_FRACTION` | Size of the application icon on a thumbnail |
 | `tools/globe-texture` | `TWILIGHT_LO` / `TWILIGHT_HI` | Solar elevations bounding the twilight blend |
 
-`ORBIT_RADIUS · sin(VIEW_TILT_RADIANS)` sets where the front window sits: near
-1 it rests on the globe's lower rim, below that it starts to cover the globe's
-face, and well above it the ring stops looking like a band around the equator.
+`(ORBIT_RADIUS · sin(VIEW_TILT_RADIANS) − ORBIT_LIFT · cos(VIEW_TILT_RADIANS))`
+is where the front window sits, in globe radii below the centre. Around 0.65 it
+crosses just under the equator; larger and it slides down towards the pole,
+smaller and it rides up over the globe's face.
+
+The tiles are deliberately large, which on a 1080p screen means they overlap
+and cover part of the globe. `ITEM_FRACTION` is the one number to turn down if
+you would rather see more of the Earth.
 
 After editing, re-run `./install.sh`.
 

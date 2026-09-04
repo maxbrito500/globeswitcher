@@ -114,8 +114,8 @@ class Globe:
 
         # Reused every frame so a render allocates nothing.
         self._out = np.zeros((self.diameter, self.diameter, 3), dtype=np.uint8)
-        self._columns = np.empty(self._flat_inside.size, dtype=np.int32)
-        self._samples = np.empty((self._flat_inside.size, 3), dtype=np.uint8)
+        self._columns = np.empty(self.diameter * self.diameter, dtype=np.int32)
+        self._indices = np.empty(self.diameter * self.diameter, dtype=np.int32)
 
     # -- texture --------------------------------------------------------------
 
@@ -138,18 +138,26 @@ class Globe:
         self._map_mtime = mtime
         height, width = self._map.shape[:2]
 
-        # Everything the render loop needs, in the form it needs it: the map
-        # as a flat list of pixels, and per-disc-pixel the start of its row
-        # and its column at zero rotation. A frame is then an integer add and
-        # one gather.
-        self._map_flat = self._map.reshape(-1, 3)
-        rows = np.clip(
+        # Everything the render loop needs, in the form it needs it. A row of
+        # black is appended to the map and every pixel outside the disc is
+        # pointed at it, so a frame is one gather straight into the output
+        # buffer: no separate scatter, and no mask.
+        self._map_flat = np.vstack([
+            self._map.reshape(-1, 3),
+            np.zeros((width, 3), dtype=np.uint8)])
+        black_row = height * width
+
+        rows = np.full(self.diameter * self.diameter, black_row, dtype=np.int32)
+        inside_rows = np.clip(
             (self._row.ravel()[self._flat_inside] * height).astype(np.int32),
             0, height - 1)
-        self._row_offset = rows * width
-        self._column_base = np.mod(
-            (self._turn_inside * width).astype(np.int64), width
-        ).astype(np.int32)
+        rows[self._flat_inside] = inside_rows * width
+        self._row_offset = rows
+
+        columns = np.zeros(self.diameter * self.diameter, dtype=np.int32)
+        columns[self._flat_inside] = np.mod(
+            (self._turn_inside * width).astype(np.int64), width).astype(np.int32)
+        self._column_base = columns
         return True
 
     def refresh_if_stale(self, generator):
@@ -202,11 +210,11 @@ class Globe:
         np.add(self._column_base, shift, out=columns)
         np.subtract(columns, width, out=columns, where=columns >= width)
 
-        np.take(self._map_flat, self._row_offset + columns, axis=0,
-                out=self._samples)
+        indices = self._indices
+        np.add(self._row_offset, columns, out=indices)
 
         flat = out.reshape(-1, 3)
-        flat[self._flat_inside] = self._samples
+        np.take(self._map_flat, indices, axis=0, out=flat)
 
         # Blend towards the atmosphere colour near the limb.
         rim = flat[self._rim_positions].astype(np.int32)
