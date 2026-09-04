@@ -79,21 +79,28 @@ def _backdrop(width, height):
 
 
 def render(path, width=1920, height=1080, selected=1, rotation=None):
+    """Draw one switcher frame to `path`.
+
+    `rotation` defaults to a little short of the selected window's longitude,
+    so the still shows the globe caught mid-roll rather than perfectly settled.
+    """
     windows = [DemoWindow(title, _find_icon(names))
                for title, names in DEMO_WINDOWS]
 
     layout = ui.Layout(width, height, len(windows))
-    frame = ui.Frame(_backdrop(width, height), layout)
-    background = frame.build_background(
-        windows, [w.icon for w in windows], selected, windows[selected].title)
+    frame = ui.Frame(_backdrop(width, height), layout,
+                     [w.icon for w in windows], [w.title for w in windows])
 
-    canvas = background.copy()
+    if rotation is None:
+        step = 2.0 * math.pi / len(windows)
+        rotation = layout.longitude(selected) - step * 0.18
+
     earth = globe_module.Globe(layout.globe_diameter)
-    if earth.ready:
-        # A view centred on the Atlantic shows land on both sides of the
-        # terminator, which reads better in a still image than a random angle.
-        turn = math.pi * 0.15 if rotation is None else rotation
-        frame.compose(earth.render(turn), earth.alpha, canvas)
+    globe_rgb = earth.render(rotation)
+
+    canvas = np.array(frame.backdrop, copy=True)
+    block, x, y = frame.render(rotation, selected, globe_rgb, earth.alpha)
+    canvas[y:y + block.shape[0], x:x + block.shape[1]] = block
 
     Image.fromarray(canvas, "RGB").save(path)
     return path

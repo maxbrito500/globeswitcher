@@ -37,7 +37,7 @@ TEXTURE_PATH = os.path.join(
 # never more than a few minutes stale.
 MAX_TEXTURE_AGE_SECONDS = 600
 
-VIEW_TILT_RADIANS = 0.32        # look at the globe slightly from above
+VIEW_TILT_RADIANS = 0.62        # look down on the globe from ~35 degrees
 ATMOSPHERE_RGB = (0.32, 0.55, 0.95)
 ATMOSPHERE_STRENGTH = 0.45
 RIM_START = 0.72                # fraction of the radius where the rim begins
@@ -77,9 +77,12 @@ class Globe:
         nx = px
         ny = -py                                    # screen y grows downward
 
+        # Camera lifted VIEW_TILT_RADIANS above the equator, looking north
+        # down onto the globe. Rotating screen space back into world space is
+        # what turns a pixel into a latitude and longitude.
         tilt = VIEW_TILT_RADIANS
-        my = math.cos(tilt) * ny - math.sin(tilt) * nz
-        mz = math.sin(tilt) * ny + math.cos(tilt) * nz
+        my = math.cos(tilt) * ny + math.sin(tilt) * nz
+        mz = -math.sin(tilt) * ny + math.cos(tilt) * nz
 
         latitude = np.arcsin(np.clip(my, -1.0, 1.0))
         longitude = np.arctan2(nx, mz)

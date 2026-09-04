@@ -13,8 +13,9 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""The switcher daemon: grabs Alt+Tab, shows the globe, activates a window."""
+"""The switcher daemon: grabs Alt+Tab, rolls the globe, activates a window."""
 
+import math
 import os
 import select
 import sys
@@ -24,22 +25,17 @@ from . import globe as globe_module
 from . import ui
 from . import x11
 
-SPIN_PERIOD_SECONDS = 48.0
 FRAME_INTERVAL = 1.0 / 30.0
+
+# How long the globe takes to roll one window round to the front.
+ROLL_DURATION = 0.22
 
 # Windows on other workspaces are hidden, matching what most desktops do by
 # default. Set to False to switch across every workspace.
 CURRENT_DESKTOP_ONLY = True
 
 ALL_DESKTOPS = 0xFFFFFFFF
-
-DEBUG = bool(os.environ.get("GLOBESWITCHER_DEBUG"))
-
-
-def log(message):
-    """Trace switcher activity when GLOBESWITCHER_DEBUG is set."""
-    if DEBUG:
-        print(f"globeswitcher: {message}", file=sys.stderr, flush=True)
+TWO_PI = 2.0 * math.pi
 
 SKIPPED_TYPES = (
     "_NET_WM_WINDOW_TYPE_DESKTOP",
@@ -51,6 +47,19 @@ SKIPPED_TYPES = (
     "_NET_WM_WINDOW_TYPE_TOOLTIP",
     "_NET_WM_WINDOW_TYPE_NOTIFICATION",
 )
+
+DEBUG = bool(os.environ.get("GLOBESWITCHER_DEBUG"))
+
+
+def log(message):
+    """Trace switcher activity when GLOBESWITCHER_DEBUG is set."""
+    if DEBUG:
+        print(f"globeswitcher: {message}", file=sys.stderr, flush=True)
+
+
+def shortest_turn(delta):
+    """Fold an angle difference into the shorter way round the circle."""
+    return (delta + math.pi) % TWO_PI - math.pi
 
 
 class WindowEntry:
@@ -88,8 +97,12 @@ class Switcher:
         self._selected = 0
         self._frame = None
         self._layout = None
-        self._opened_at = 0.0
-        self._base_rotation = _timezone_rotation()
+
+        # Rotation animation.
+        self._rotation = 0.0
+        self._roll_from = 0.0
+        self._roll_to = 0.0
+        self._roll_start = 0.0
 
     # -- key grabs ------------------------------------------------------------
 
@@ -123,7 +136,6 @@ class Switcher:
         """Fold newly seen windows into the MRU list, drop the departed."""
         current = self.display.client_list()
         known = set(self._mru)
-        # New windows appear at the top of the stack, so add them front-first.
         for xid in reversed(current):
             if xid not in known:
                 self._mru.append(xid)
@@ -149,6 +161,43 @@ class Switcher:
                 self.display.window_icon(xid)))
         return entries
 
+    # -- rotation -------------------------------------------------------------
+
+    def _roll_to_selected(self, immediate=False):
+        """Aim the globe so the selected window ends up facing the viewer."""
+        target = self._layout.longitude(self._selected)
+        if immediate:
+            self._rotation = target
+            self._roll_from = self._roll_to = target
+            self._roll_start = 0.0
+            return
+
+        # Retarget from wherever the globe is right now, so a Tab pressed
+        # mid-roll stays smooth instead of queueing up behind the last one.
+        self._roll_from = self._rotation
+        self._roll_to = self._rotation + shortest_turn(target - self._rotation)
+        self._roll_start = time.monotonic()
+
+    @property
+    def _rolling(self):
+        return self._roll_start > 0.0
+
+    def _advance(self):
+        """Step the roll animation. Returns True if the globe moved."""
+        if not self._rolling:
+            return False
+
+        progress = (time.monotonic() - self._roll_start) / ROLL_DURATION
+        if progress >= 1.0:
+            self._rotation = self._roll_to
+            self._roll_start = 0.0
+            return True
+
+        eased = 1.0 - (1.0 - progress) ** 3          # ease out cubic
+        self._rotation = self._roll_from + \
+            (self._roll_to - self._roll_from) * eased
+        return True
+
     # -- the popup ------------------------------------------------------------
 
     def open(self, backward, timestamp):
@@ -168,99 +217,70 @@ class Switcher:
         self._entries = entries
         self._layout = ui.Layout(
             self.display.width, self.display.height, len(entries))
-        self._frame = ui.Frame(ui.dim(screen), self._layout)
+        self._frame = ui.Frame(
+            ui.dim(screen), self._layout,
+            [entry.icon for entry in entries],
+            [entry.title for entry in entries])
 
-        # The window you are on is index 0, so a forward Tab lands on the next
-        # one, exactly like every other switcher.
-        self._selected = (len(entries) - 1) if backward else min(1, len(entries) - 1)
+        # Start with the window you are on facing you, then roll to the next
+        # one, so opening the switcher is itself a visible turn.
+        self._selected = 0
+        self._roll_to_selected(immediate=True)
+        self._selected = (len(entries) - 1) if backward else \
+            min(1, len(entries) - 1)
+        self._roll_to_selected()
 
         self._open = True
-        self._opened_at = time.monotonic()
 
-        # Fill the buffer before mapping, so the window never flashes empty.
-        self._frame.build_background(
-            self._entries, [e.icon for e in self._entries],
-            self._selected, self._entries[self._selected].title)
-        self.canvas.set_frame(self._frame.background)
-
+        # Fill the whole buffer with the dimmed desktop before mapping, so the
+        # window never flashes empty and the area outside the animated region
+        # is already correct.
+        self.canvas.set_frame(self._frame.backdrop)
         self.canvas.show()
         self.display.sync()
 
         # XGrabKeyboard only works on a viewable window, so this has to come
         # after the map, not before it.
         if not self.display.grab_keyboard(self.canvas.window, timestamp):
-            self._open = False
-            self.canvas.hide()
-            self._entries = []
-            self._frame = None
-            self._layout = None
             log("keyboard grab refused")
+            self._teardown()
             return False
 
-        self._paint_globe(blit_all=True)
+        self._paint(blit_all=True)
         log(f"opened, selected={self._selected}")
         return True
+
+    def _teardown(self):
+        self._open = False
+        self.canvas.hide()
+        self._entries = []
+        self._frame = None
+        self._layout = None
+        self._roll_start = 0.0
 
     def close(self, activate, timestamp):
         if not self._open:
             return
 
-        self._open = False
-        self.canvas.hide()
+        log(f"close activate={activate} selected={self._selected}")
+        entry = self._entries[self._selected] if self._entries else None
+
+        self._teardown()
         self.display.ungrab_keyboard(timestamp)
 
-        log(f"close activate={activate} selected={self._selected}")
-        if activate and self._entries:
-            entry = self._entries[self._selected]
+        if activate and entry is not None:
             self.display.activate_window(entry.xid, timestamp)
             if entry.xid in self._mru:
                 self._mru.remove(entry.xid)
             self._mru.insert(0, entry.xid)
 
-        self._entries = []
-        self._frame = None
-        self._layout = None
-
-    def _redraw_background(self):
-        entry = self._entries[self._selected]
-        self._frame.build_background(
-            self._entries, [e.icon for e in self._entries],
-            self._selected, entry.title)
-        self.canvas.set_frame(self._frame.background)
-        self._paint_globe(blit_all=True)
-
-    def _paint_globe(self, blit_all=False):
-        if not self.globe.ready:
-            if blit_all:
-                self.canvas.blit()
-            return
-
-        elapsed = time.monotonic() - self._opened_at
-        rotation = self._base_rotation + \
-            elapsed / SPIN_PERIOD_SECONDS * 2 * 3.141592653589793
-
-        x, y, width, height = self._layout.globe_box
-        patch = self._frame.background[y:y + height, x:x + width].copy()
-        rendered = self.globe.render(rotation)
-
-        alpha = self.globe.alpha[..., None]
-        blended = patch.astype("float32") * (1.0 - alpha) + \
-            rendered.astype("float32") * alpha
-        self.canvas.write_rect(blended.astype("uint8"), x, y, blit=not blit_all)
-
-        if blit_all:
-            self.canvas.blit()
-
-    def _tick(self):
-        if self._open:
-            self._paint_globe()
-
     def select(self, delta):
-        if not self._entries:
+        if len(self._entries) < 2:
             return
         self._selected = (self._selected + delta) % len(self._entries)
         log(f"select -> index {self._selected} of {len(self._entries)}")
-        self._redraw_background()
+        self._roll_to_selected()
+        self._paint()
 
     def close_selected(self, timestamp):
         if not self._entries:
@@ -276,8 +296,34 @@ class Switcher:
         self._selected = min(self._selected, len(self._entries) - 1)
         self._layout = ui.Layout(
             self.display.width, self.display.height, len(self._entries))
-        self._frame.layout = self._layout
-        self._redraw_background()
+        self._frame = ui.Frame(
+            self._frame.backdrop, self._layout,
+            [e.icon for e in self._entries], [e.title for e in self._entries])
+        self._roll_to_selected(immediate=True)
+        self._paint(blit_all=True)
+
+    # -- painting -------------------------------------------------------------
+
+    def _paint(self, blit_all=False):
+        if not self._open:
+            return
+
+        rendered = self.globe.render(self._rotation) if self.globe.ready else None
+        if rendered is None:
+            width = self._layout.globe_diameter
+            import numpy as np
+            rendered = np.zeros((width, width, 3), dtype=np.uint8)
+
+        block, x, y = self._frame.render(
+            self._rotation, self._selected, rendered, self.globe.alpha)
+        self.canvas.write_rect(block, x, y, blit=not blit_all)
+
+        if blit_all:
+            self.canvas.blit()
+
+    def _tick(self):
+        if self._open and self._advance():
+            self._paint()
 
     # -- main loop ------------------------------------------------------------
 
@@ -292,7 +338,9 @@ class Switcher:
     def _loop(self):
         fd = self.display.fd
         while True:
-            timeout = FRAME_INTERVAL if self._open else None
+            # Only wake for frames while the globe is actually turning; a
+            # switcher sitting still should cost nothing.
+            timeout = FRAME_INTERVAL if (self._open and self._rolling) else None
             if not self.display.pending():
                 select.select([fd], [], [], timeout)
 
@@ -313,7 +361,8 @@ class Switcher:
                 self._note_activation()
 
     def _on_key_press(self, key):
-        keysym = self.display.keysym(key.keycode, 1 if key.state & x11.SHIFT_MASK else 0)
+        keysym = self.display.keysym(
+            key.keycode, 1 if key.state & x11.SHIFT_MASK else 0)
         backward = bool(key.state & x11.SHIFT_MASK)
 
         if keysym in (x11.XK_Tab, x11.XK_ISO_Left_Tab):
@@ -341,13 +390,6 @@ class Switcher:
         keysym = self.display.keysym(key.keycode, 0)
         if keysym in (x11.XK_Alt_L, x11.XK_Alt_R):
             self.close(True, key.time)
-
-
-def _timezone_rotation():
-    """Rotation that puts the user's own timezone towards the viewer."""
-    offset_seconds = -time.timezone if not time.daylight else -time.altzone
-    hours = offset_seconds / 3600.0
-    return -hours * (3.141592653589793 / 12.0)
 
 
 def main():
