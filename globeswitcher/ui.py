@@ -41,10 +41,17 @@ ITEM_FRACTION = 0.145
 ITEM_MIN = 84
 ITEM_MAX = 190
 
-# The ring the windows ride on, in globe radii. It has to be wide enough that
-# ORBIT_RADIUS * sin(view tilt) > 1, or the window at the front projects inside
-# the globe's disc instead of standing clear of it.
-ORBIT_RADIUS = 1.80
+# The ring the windows ride on, in globe radii. Wide enough that
+# ORBIT_RADIUS * sin(view tilt) is about 1, which puts the window at the front
+# on the globe's lower rim rather than across its face.
+ORBIT_RADIUS = 2.40
+
+# The gap between neighbouring windows on the ring. Fixed rather than
+# 360/n, so a handful of windows sit together as a band across the equator
+# instead of being flung out to the four cardinal points. It is only with
+# something like twenty windows that the ring closes and they wrap right
+# around the world.
+ANGULAR_STEP = math.radians(22.0)
 
 # How much nearer windows grow. This is what makes the turn read as three
 # dimensional rather than as thumbnails sliding sideways.
@@ -192,9 +199,20 @@ class Layout:
         """
         cx, cy = self.centre
         reach = self.max_item_size / 2 + 6
-        half_width = ORBIT_RADIUS * self.globe_radius + reach
+        span = self.span
 
-        top = cy - max(self.globe_radius, self.orbit_rise + reach)
+        # Only the arc the windows can actually reach needs room. With a few
+        # windows they never swing far from the front, and the region stays
+        # small enough to keep a frame cheap.
+        widest = 1.0 if span >= math.pi / 2 else math.sin(span)
+        half_width = ORBIT_RADIUS * self.globe_radius * widest + reach
+
+        # Leave room for the title plate even when a single window makes the
+        # ring itself narrow, or a long title would be cut off at the edge.
+        half_width = max(half_width, self.width * 0.32)
+
+        highest = self.orbit_rise * math.cos(span)      # negative past 90
+        top = cy - max(self.globe_radius, reach - highest)
         bottom = max(cy + self.globe_radius,
                      cy + self.orbit_rise + reach,
                      self.title_top + self.title_height)
@@ -203,9 +221,19 @@ class Layout:
                 min(self.width, int(cx + half_width) + 1),
                 min(self.height, int(bottom) + 1))
 
+    @property
+    def step(self):
+        """Angle between neighbouring windows, never more than a full turn."""
+        return min(ANGULAR_STEP, 2.0 * math.pi / self.count)
+
+    @property
+    def span(self):
+        """How far round the globe the windows reach, from first to last."""
+        return min((self.count - 1) * self.step, math.pi)
+
     def longitude(self, index):
         """The fixed longitude a window is pinned to on the globe."""
-        return index * 2.0 * math.pi / self.count
+        return index * self.step
 
     def orbit(self, rotation):
         """Every window's place on screen, far ones first.
@@ -368,16 +396,18 @@ class Frame:
     """Draws a frame of the switcher over a fixed, already dimmed backdrop."""
 
     def __init__(self, backdrop, layout, thumbnails, icons, titles):
-        self.backdrop = backdrop            # RGB uint8, screen sized, as captured
+        # `backdrop` is the captured desktop, already dimmed. It has to be
+        # dimmed as a whole rather than only under the drawn region: the rest
+        # of it still shows on screen, and a brightness step at the region's
+        # edge would draw a rectangle across the desktop.
+        self.backdrop = backdrop            # RGB uint8, screen sized
         self.layout = layout
         self.titles = titles
         self.tiles = TileFactory(thumbnails, icons, titles)
 
-        # Only the region is ever drawn, so only the region is worth dimming;
-        # darkening the whole screen would cost more than rendering a frame.
         left, top, right, bottom = layout.region
         self._origin = (left, top)
-        self._base = dim(np.ascontiguousarray(backdrop[top:bottom, left:right]))
+        self._base = np.ascontiguousarray(backdrop[top:bottom, left:right])
         self._canvas = np.empty_like(self._base)
 
         self._title_font = _load_font(

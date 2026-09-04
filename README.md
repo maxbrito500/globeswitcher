@@ -7,10 +7,12 @@ satellite imagery and lit by the real position of the sun.
 
 Your open windows ride on a ring around the globe's equator, each one shown as
 a live picture of what is inside it. Each Tab rolls the globe one step, so the
-next window comes round to the front and the rest travel with it — the ones on
-the far side pass behind the Earth and are hidden by it. The daylight on the
-globe is the daylight happening right now, so while you pick a window you can
-see which half of the world is awake.
+next window comes round to the front and the rest travel with it. A few windows
+sit together as a band across the equator; it takes something like twenty
+before the ring closes and they wrap right around the world, with the far side
+passing behind the Earth. The daylight on the globe is the daylight happening
+right now, so while you pick a window you can see which half of the world is
+awake.
 
 It is a plain X11 program, not a desktop extension. Nothing is plugged into
 GNOME Shell, so there is nothing to break when GNOME updates, and it works the
@@ -89,11 +91,18 @@ pixel to map row never changes and the mapping to map column changes by a
 constant. Both are precomputed once, and each frame is then a single numpy
 gather — about 7 ms for a 540-pixel globe.
 
-**The windows.** Window `i` is pinned to longitude `i · 360°/n` on the equator,
+**The windows.** Window `i` is pinned to longitude `i · 22°` on the equator,
 and its position on screen is that point projected through the same camera the
-globe is drawn with — lifted about 40° above the equator, looking north. From
-its depth come two more things: windows nearer the viewer are drawn larger,
-and the ones swinging round the back are dimmed.
+globe is drawn with — lifted about 24° above the equator, looking north, which
+keeps the ring a shallow band around the waist rather than an arc over the
+poles. From its depth come two more things: windows nearer the viewer are
+drawn larger, and the ones swinging round the back are dimmed.
+
+The spacing is a fixed angle rather than `360°/n`. Dividing the circle would
+fling four windows out to the four cardinal points and leave the globe ringed
+by empty space; a fixed step keeps a handful of windows together in front of
+you, and only closes the ring once there are enough of them to go the whole
+way round. Above that the step shrinks to fit, and the tiles shrink with it.
 
 Each one is drawn as a capture of the window's own contents, kept at its real
 proportions so a wide window still reads as wide, with the application icon
@@ -109,9 +118,11 @@ disc, a window crossing the limb is cut exactly at the silhouette.
 **Rolling.** The selected window is whichever one faces you, so selection and
 rotation are the same thing: pressing Tab picks the next window and sets the
 globe's target angle to that window's longitude, and the globe eases there
-over about a fifth of a second, always taking the shorter way round. A Tab
+over about a quarter of a second, always taking the shorter way round. A Tab
 pressed mid-roll just retargets from wherever the globe currently is, so
-holding Alt and drumming on Tab stays smooth instead of queueing up.
+holding Alt and drumming on Tab stays smooth instead of queueing up. Wrapping
+from the last window back to the first has to travel the whole band, so that
+roll is given proportionally longer — it reads as a turn rather than a jump.
 
 **The window list.** Read from the X server through EWMH: `_NET_CLIENT_LIST`
 for the windows, `_NET_WM_ICON` for the icons, `_NET_WM_NAME` for the titles,
@@ -149,7 +160,7 @@ Constants at the top of the source:
 
 | File | Constant | Meaning |
 |---|---|---|
-| `globeswitcher/daemon.py` | `ROLL_DURATION` | Seconds to roll one window to the front |
+| `globeswitcher/daemon.py` | `ROLL_DURATION` / `ROLL_DURATION_MAX` | Seconds to roll one window to the front, and the cap for a long wrap |
 | `globeswitcher/daemon.py` | `FRAME_INTERVAL` | Frame pacing while rolling |
 | `globeswitcher/daemon.py` | `CURRENT_DESKTOP_ONLY` | Hide windows on other workspaces |
 | `globeswitcher/daemon.py` | `THUMBNAIL_TTL` / `THUMBNAIL_BUDGET` | How long captures are kept, and how long an open may spend taking them |
@@ -157,14 +168,16 @@ Constants at the top of the source:
 | `globeswitcher/globe.py` | `MAX_TEXTURE_AGE_SECONDS` | How stale the map may get before a refresh |
 | `globeswitcher/ui.py` | `GLOBE_FRACTION` | Globe diameter, as a share of the screen's short axis |
 | `globeswitcher/ui.py` | `ORBIT_RADIUS` | Ring radius, in globe radii |
+| `globeswitcher/ui.py` | `ANGULAR_STEP` | Angle between neighbouring windows |
 | `globeswitcher/ui.py` | `DEPTH_SCALE` | How much nearer windows grow |
 | `globeswitcher/ui.py` | `BACK_OPACITY` | Dimming of windows on the far side |
 | `globeswitcher/ui.py` | `BACKDROP_DIM` | How much of the desktop's brightness remains |
 | `globeswitcher/ui.py` | `BADGE_FRACTION` | Size of the application icon on a thumbnail |
 | `tools/globe-texture` | `TWILIGHT_LO` / `TWILIGHT_HI` | Solar elevations bounding the twilight blend |
 
-`ORBIT_RADIUS · sin(VIEW_TILT_RADIANS)` must stay above 1, or the window at
-the front projects inside the globe's disc instead of standing clear of it.
+`ORBIT_RADIUS · sin(VIEW_TILT_RADIANS)` sets where the front window sits: near
+1 it rests on the globe's lower rim, below that it starts to cover the globe's
+face, and well above it the ring stops looking like a band around the equator.
 
 After editing, re-run `./install.sh`.
 
@@ -204,9 +217,9 @@ GLOBESWITCHER_DEBUG=1 ~/.local/bin/globeswitcher
 - Thumbnails of windows that are buried behind others depend on a compositing
   window manager keeping their contents. Without a compositor an obscured
   window has nothing to capture, and it falls back to its application icon.
-- With very many windows the ring gets crowded near the limbs, where the
-  spacing foreshortens. Icons shrink to compensate, but past about twenty
-  windows they overlap.
+- Past about twenty windows the ring closes and the tiles start to overlap
+  near the limbs, where the spacing foreshortens. They shrink to compensate,
+  but only so far.
 
 ## Credits
 

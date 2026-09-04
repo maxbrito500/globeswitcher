@@ -29,8 +29,12 @@ from . import x11
 
 FRAME_INTERVAL = 1.0 / 60.0
 
-# How long the globe takes to roll one window round to the front.
+# How long the globe takes to roll one window round to the front. Rolling
+# further -- wrapping from the last window back to the first, which travels
+# the whole arc -- is given proportionally longer, up to a limit, so a long
+# turn reads as a turn rather than a jump.
 ROLL_DURATION = 0.26
+ROLL_DURATION_MAX = 0.62
 
 # Window thumbnails. Captured at Alt+Tab time, kept briefly so a second
 # Alt+Tab is instant, and bounded so a desktop full of windows cannot make
@@ -117,6 +121,7 @@ class Switcher:
         self._roll_from = 0.0
         self._roll_to = 0.0
         self._roll_start = 0.0
+        self._roll_duration = ROLL_DURATION
 
     # -- key grabs ------------------------------------------------------------
 
@@ -223,6 +228,7 @@ class Switcher:
             self._rotation = target
             self._roll_from = self._roll_to = target
             self._roll_start = 0.0
+            self._roll_duration = ROLL_DURATION
             return
 
         # Retarget from wherever the globe is right now, so a Tab pressed
@@ -230,6 +236,10 @@ class Switcher:
         self._roll_from = self._rotation
         self._roll_to = self._rotation + shortest_turn(target - self._rotation)
         self._roll_start = time.monotonic()
+
+        steps = abs(self._roll_to - self._roll_from) / max(self._layout.step, 1e-6)
+        self._roll_duration = min(
+            ROLL_DURATION_MAX, ROLL_DURATION * max(1.0, steps ** 0.5))
 
     @property
     def _rolling(self):
@@ -240,7 +250,7 @@ class Switcher:
         if not self._rolling:
             return False
 
-        progress = (time.monotonic() - self._roll_start) / ROLL_DURATION
+        progress = (time.monotonic() - self._roll_start) / self._roll_duration
         if progress >= 1.0:
             self._rotation = self._roll_to
             self._roll_start = 0.0
@@ -277,7 +287,7 @@ class Switcher:
         self._layout = ui.Layout(
             self.display.width, self.display.height, len(entries))
         self._frame = ui.Frame(
-            screen, self._layout,
+            ui.dim(screen), self._layout,
             [entry.thumbnail for entry in entries],
             [entry.icon for entry in entries],
             [entry.title for entry in entries])

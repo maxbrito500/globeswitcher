@@ -119,7 +119,7 @@ def _backdrop(width, height):
     return rgb.astype(np.uint8)
 
 
-def render(path, width=1920, height=1080, selected=1, rotation=None):
+def render(path, width=1920, height=1080, selected=2, rotation=None):
     """Draw one switcher frame to `path`.
 
     `rotation` defaults to a little short of the selected window's longitude,
@@ -129,8 +129,9 @@ def render(path, width=1920, height=1080, selected=1, rotation=None):
         DemoWindow(title, _find_icon(names), _mock_window(shape, palette, index))
         for index, (title, names, shape, palette) in enumerate(DEMO_WINDOWS)]
 
+    backdrop = ui.dim(_backdrop(width, height))
     layout = ui.Layout(width, height, len(windows))
-    frame = ui.Frame(_backdrop(width, height), layout,
+    frame = ui.Frame(backdrop, layout,
                      [w.thumbnail for w in windows],
                      [w.icon for w in windows],
                      [w.title for w in windows])
@@ -142,7 +143,7 @@ def render(path, width=1920, height=1080, selected=1, rotation=None):
     earth = globe_module.Globe(layout.globe_diameter)
     globe_rgb = earth.render(rotation)
 
-    canvas = np.array(frame.backdrop, copy=True)
+    canvas = np.array(backdrop, copy=True)
     block, x, y = frame.render(rotation, selected, globe_rgb, earth.alpha)
     canvas[y:y + block.shape[0], x:x + block.shape[1]] = block
 

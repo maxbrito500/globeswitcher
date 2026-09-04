@@ -37,7 +37,7 @@ TEXTURE_PATH = os.path.join(
 # never more than a few minutes stale.
 MAX_TEXTURE_AGE_SECONDS = 600
 
-VIEW_TILT_RADIANS = 0.70        # look down on the globe from ~40 degrees
+VIEW_TILT_RADIANS = 0.42        # look down on the globe from ~24 degrees
 ATMOSPHERE_RGB = (0.32, 0.55, 0.95)
 ATMOSPHERE_STRENGTH = 0.45
 RIM_START = 0.72                # fraction of the radius where the rim begins
