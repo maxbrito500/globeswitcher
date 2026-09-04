@@ -150,7 +150,9 @@ its ring. That rectangle is worked out once from the geometry, the dimmed
 desktop under it is prepared once, and each frame redraws and pushes only
 that.
 
-Four things make 60 frames a second reachable in Python.
+Four things keep the frame rate up in Python — about 20 ms a frame at the
+default sizes, so a roll gets a dozen or so frames rather than the handful
+that reads as stuttering.
 
 The globe's rotation is a whole-column shift of the map, so a frame is an
 integer add and one `numpy.take` rather than any floating-point work. A row of
@@ -199,8 +201,9 @@ Constants at the top of the source:
 
 `(ORBIT_RADIUS · sin(VIEW_TILT_RADIANS) − ORBIT_LIFT · cos(VIEW_TILT_RADIANS))`
 is where the front window sits, in globe radii below the centre. Around 0.65 it
-crosses just under the equator; larger and it slides down towards the pole,
-smaller and it rides up over the globe's face.
+crosses just under the equator, and it slides down towards the pole from there;
+the default is lower still, about 0.28, which lifts the band across the globe's
+face so the tiles sit where you are already looking.
 
 The tiles are deliberately large, which on a 1080p screen means they overlap
 and cover part of the globe. `ITEM_FRACTION` is the one number to turn down if

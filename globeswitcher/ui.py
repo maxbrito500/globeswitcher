@@ -37,9 +37,9 @@ from .globe import VIEW_TILT_RADIANS
 
 # Layout, as fractions of the screen's short axis.
 GLOBE_FRACTION = 0.50
-ITEM_FRACTION = 0.29
-ITEM_MIN = 168
-ITEM_MAX = 380
+ITEM_FRACTION = 0.377
+ITEM_MIN = 218
+ITEM_MAX = 494
 
 # The ring the windows ride on, in globe radii. Wide enough that
 # ORBIT_RADIUS * sin(view tilt) is about 1, which puts the window at the front
@@ -51,7 +51,7 @@ ORBIT_RADIUS = 2.40
 # camera tilt multiplies the offset by the ring's radius -- and the windows end
 # up sweeping past the south pole. Lifting the ring slides the whole ellipse
 # back up, so it crosses just below the equator where it belongs.
-ORBIT_LIFT = 0.36
+ORBIT_LIFT = 0.765
 
 # The gap between neighbouring windows on the ring. Fixed rather than
 # 360/n, so a handful of windows sit together as a band across the equator
