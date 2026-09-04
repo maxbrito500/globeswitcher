@@ -5,11 +5,12 @@ satellite imagery and lit by the real position of the sun.
 
 ![The globe switcher](docs/preview.jpg)
 
-Your open windows ride on a ring around the globe's equator. Each Tab rolls
-the globe one step, so the next window comes round to the front and the rest
-travel with it — the ones on the far side pass behind the Earth and are hidden
-by it. The daylight on the globe is the daylight happening right now, so while
-you pick a window you can see which half of the world is awake.
+Your open windows ride on a ring around the globe's equator, each one shown as
+a live picture of what is inside it. Each Tab rolls the globe one step, so the
+next window comes round to the front and the rest travel with it — the ones on
+the far side pass behind the Earth and are hidden by it. The daylight on the
+globe is the daylight happening right now, so while you pick a window you can
+see which half of the world is awake.
 
 It is a plain X11 program, not a desktop extension. Nothing is plugged into
 GNOME Shell, so there is nothing to break when GNOME updates, and it works the
@@ -86,13 +87,20 @@ is downloaded once and cached; everything after that works offline.
 is an equirectangular map only shifts the longitude, so the mapping from screen
 pixel to map row never changes and the mapping to map column changes by a
 constant. Both are precomputed once, and each frame is then a single numpy
-gather — about 5 ms for a 430-pixel globe.
+gather — about 7 ms for a 540-pixel globe.
 
 **The windows.** Window `i` is pinned to longitude `i · 360°/n` on the equator,
 and its position on screen is that point projected through the same camera the
-globe is drawn with — lifted about 35° above the equator, looking north. From
+globe is drawn with — lifted about 40° above the equator, looking north. From
 its depth come two more things: windows nearer the viewer are drawn larger,
 and the ones swinging round the back are dimmed.
+
+Each one is drawn as a capture of the window's own contents, kept at its real
+proportions so a wide window still reads as wide, with the application icon
+badged in the corner. Captures are taken when you press Alt+Tab and kept for
+twenty seconds, so a second Alt+Tab costs nothing; a per-open time budget
+means a desktop full of windows cannot make the switcher slow to appear, and
+anything left over falls back to the application icon until the next open.
 
 Which windows are hidden needs no test for it. The far half is drawn first,
 then the globe, then the near half; because the globe is opaque inside its
@@ -122,8 +130,18 @@ Everything moves while the globe rolls, so there is no static background to
 reuse — but everything that moves is inside one rectangle around the globe and
 its ring. That rectangle is worked out once from the geometry, the dimmed
 desktop under it is prepared once, and each frame redraws and pushes only
-that: about 13 ms, comfortably inside a 30 fps budget. When the roll settles,
-drawing stops entirely and the daemon goes back to blocking on X input.
+that.
+
+Three things make 60 frames a second reachable in Python. The globe's rotation
+is a whole-column shift of the map, so a frame is an integer add and one
+`numpy.take` rather than any floating-point work. Compositing is 32-bit
+integer arithmetic straight into numpy arrays, never through PIL images. And
+the finished frame is written into a **MIT-SHM** buffer the X server already
+has mapped, so handing it over costs nothing instead of pushing four megabytes
+down a socket — that alone took a frame from 21 ms to 17 ms.
+
+When the roll settles, drawing stops entirely and the daemon goes back to
+blocking on X input.
 
 ## Configuration
 
@@ -132,7 +150,9 @@ Constants at the top of the source:
 | File | Constant | Meaning |
 |---|---|---|
 | `globeswitcher/daemon.py` | `ROLL_DURATION` | Seconds to roll one window to the front |
+| `globeswitcher/daemon.py` | `FRAME_INTERVAL` | Frame pacing while rolling |
 | `globeswitcher/daemon.py` | `CURRENT_DESKTOP_ONLY` | Hide windows on other workspaces |
+| `globeswitcher/daemon.py` | `THUMBNAIL_TTL` / `THUMBNAIL_BUDGET` | How long captures are kept, and how long an open may spend taking them |
 | `globeswitcher/globe.py` | `VIEW_TILT_RADIANS` | How far above the equator you look from |
 | `globeswitcher/globe.py` | `MAX_TEXTURE_AGE_SECONDS` | How stale the map may get before a refresh |
 | `globeswitcher/ui.py` | `GLOBE_FRACTION` | Globe diameter, as a share of the screen's short axis |
@@ -140,6 +160,7 @@ Constants at the top of the source:
 | `globeswitcher/ui.py` | `DEPTH_SCALE` | How much nearer windows grow |
 | `globeswitcher/ui.py` | `BACK_OPACITY` | Dimming of windows on the far side |
 | `globeswitcher/ui.py` | `BACKDROP_DIM` | How much of the desktop's brightness remains |
+| `globeswitcher/ui.py` | `BADGE_FRACTION` | Size of the application icon on a thumbnail |
 | `tools/globe-texture` | `TWILIGHT_LO` / `TWILIGHT_HI` | Solar elevations bounding the twilight blend |
 
 `ORBIT_RADIUS · sin(VIEW_TILT_RADIANS)` must stay above 1, or the window at
@@ -180,8 +201,9 @@ GLOBESWITCHER_DEBUG=1 ~/.local/bin/globeswitcher
   application's windows, short of a compositor-specific extension.
 - The switcher is drawn on the primary screen's geometry; on a multi-monitor
   setup it covers the full X screen rather than one monitor.
-- Windows are shown as application icons, not live thumbnails. Live thumbnails
-  on X11 need a compositing detour that would cost more than it is worth here.
+- Thumbnails of windows that are buried behind others depend on a compositing
+  window manager keeping their contents. Without a compositor an obscured
+  window has nothing to capture, and it falls back to its application icon.
 - With very many windows the ring gets crowded near the limbs, where the
   spacing foreshortens. Icons shrink to compensate, but past about twenty
   windows they overlap.

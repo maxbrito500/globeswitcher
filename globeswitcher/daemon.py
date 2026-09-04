@@ -21,14 +21,24 @@ import select
 import sys
 import time
 
+from PIL import Image
+
 from . import globe as globe_module
 from . import ui
 from . import x11
 
-FRAME_INTERVAL = 1.0 / 30.0
+FRAME_INTERVAL = 1.0 / 60.0
 
 # How long the globe takes to roll one window round to the front.
-ROLL_DURATION = 0.22
+ROLL_DURATION = 0.26
+
+# Window thumbnails. Captured at Alt+Tab time, kept briefly so a second
+# Alt+Tab is instant, and bounded so a desktop full of windows cannot make
+# opening the switcher feel slow: whatever is left over falls back to the
+# application icon and gets captured on the next open.
+THUMBNAIL_LONG_EDGE = 480
+THUMBNAIL_TTL = 20.0
+THUMBNAIL_BUDGET = 0.10
 
 # Windows on other workspaces are hidden, matching what most desktops do by
 # default. Set to False to switch across every workspace.
@@ -63,12 +73,13 @@ def shortest_turn(delta):
 
 
 class WindowEntry:
-    __slots__ = ("xid", "title", "icon")
+    __slots__ = ("xid", "title", "icon", "thumbnail")
 
     def __init__(self, xid, title, icon):
         self.xid = xid
         self.title = title
         self.icon = icon
+        self.thumbnail = None
 
 
 class Switcher:
@@ -87,6 +98,9 @@ class Switcher:
         # keep our own by watching which window the WM makes active.
         self._mru = []
         self._sync_mru()
+
+        self._thumbnails = {}       # xid -> (image, captured at)
+        self._icons = {}            # xid -> icon array, or None
 
         self.display.select_input(self.display.root, x11.PROPERTY_CHANGE_MASK)
         self._active_atom = self.display.atom("_NET_ACTIVE_WINDOW")
@@ -157,9 +171,48 @@ class Switcher:
             if not self._is_switchable(xid):
                 continue
             entries.append(WindowEntry(
-                xid, self.display.window_title(xid),
-                self.display.window_icon(xid)))
+                xid, self.display.window_title(xid), self._icon(xid)))
         return entries
+
+    def _icon(self, xid):
+        """A window's application icon, read once and remembered.
+
+        Some applications ship a megabyte of icon sizes in the property, and
+        an icon does not change over a window's life.
+        """
+        if xid not in self._icons:
+            self._icons[xid] = self.display.window_icon(xid)
+        return self._icons[xid]
+
+    def _thumbnail(self, xid, deadline):
+        """A small picture of a window's contents, or None.
+
+        Returns a cached image straight away; otherwise captures one, unless
+        the time budget for this open has already run out.
+        """
+        cached = self._thumbnails.get(xid)
+        now = time.monotonic()
+        if cached is not None and now - cached[1] < THUMBNAIL_TTL:
+            return cached[0]
+
+        if now >= deadline:
+            return cached[0] if cached else None
+
+        rgb = x11.capture_window(self.display, xid)
+        if rgb is None:
+            return cached[0] if cached else None
+
+        image = Image.fromarray(rgb, "RGB")
+        image.thumbnail((THUMBNAIL_LONG_EDGE, THUMBNAIL_LONG_EDGE),
+                        Image.BILINEAR)
+        self._thumbnails[xid] = (image, now)
+        return image
+
+    def _forget_dead_windows(self):
+        alive = set(self._mru)
+        for cache in (self._thumbnails, self._icons):
+            for xid in [xid for xid in cache if xid not in alive]:
+                del cache[xid]
 
     # -- rotation -------------------------------------------------------------
 
@@ -201,6 +254,7 @@ class Switcher:
     # -- the popup ------------------------------------------------------------
 
     def open(self, backward, timestamp):
+        started = time.monotonic()
         entries = self._collect()
         log(f"open backward={backward} windows={len(entries)}")
         if not entries:
@@ -214,11 +268,17 @@ class Switcher:
         if screen is None:
             return False
 
+        deadline = time.monotonic() + THUMBNAIL_BUDGET
+        for entry in entries:
+            entry.thumbnail = self._thumbnail(entry.xid, deadline)
+        self._forget_dead_windows()
+
         self._entries = entries
         self._layout = ui.Layout(
             self.display.width, self.display.height, len(entries))
         self._frame = ui.Frame(
-            ui.dim(screen), self._layout,
+            screen, self._layout,
+            [entry.thumbnail for entry in entries],
             [entry.icon for entry in entries],
             [entry.title for entry in entries])
 
@@ -247,7 +307,9 @@ class Switcher:
             return False
 
         self._paint(blit_all=True)
-        log(f"opened, selected={self._selected}")
+        thumbs = sum(1 for entry in entries if entry.thumbnail is not None)
+        log(f"opened selected={self._selected} thumbnails={thumbs}/{len(entries)}"
+            f" in {(time.monotonic() - started) * 1000:.0f} ms")
         return True
 
     def _teardown(self):
@@ -298,7 +360,9 @@ class Switcher:
             self.display.width, self.display.height, len(self._entries))
         self._frame = ui.Frame(
             self._frame.backdrop, self._layout,
-            [e.icon for e in self._entries], [e.title for e in self._entries])
+            [e.thumbnail for e in self._entries],
+            [e.icon for e in self._entries],
+            [e.title for e in self._entries])
         self._roll_to_selected(immediate=True)
         self._paint(blit_all=True)
 
@@ -308,11 +372,9 @@ class Switcher:
         if not self._open:
             return
 
-        rendered = self.globe.render(self._rotation) if self.globe.ready else None
-        if rendered is None:
-            width = self._layout.globe_diameter
-            import numpy as np
-            rendered = np.zeros((width, width, 3), dtype=np.uint8)
+        # render() hands back its own reusable buffer, and returns a blank
+        # sphere rather than nothing when the map has not been generated yet.
+        rendered = self.globe.render(self._rotation)
 
         block, x, y = self._frame.render(
             self._rotation, self._selected, rendered, self.globe.alpha)

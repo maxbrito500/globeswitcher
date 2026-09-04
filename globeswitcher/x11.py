@@ -22,7 +22,6 @@ Only the parts actually used are bound.
 
 import ctypes
 import ctypes.util
-import struct
 
 import numpy as np
 
@@ -32,6 +31,20 @@ _lib_name = ctypes.util.find_library("X11")
 if not _lib_name:
     raise ImportError("libX11 not found")
 xlib = ctypes.CDLL(_lib_name)
+
+# The shared-memory extension is optional. With it, a frame is written
+# straight into memory the X server already has mapped; without it every
+# frame is copied down the socket instead.
+try:
+    _xext_name = ctypes.util.find_library("Xext")
+    xext = ctypes.CDLL(_xext_name) if _xext_name else None
+except OSError:
+    xext = None
+
+try:
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+except OSError:
+    libc = None
 
 # --- types -------------------------------------------------------------------
 
@@ -176,6 +189,37 @@ class XSetWindowAttributes(ctypes.Structure):
     ]
 
 
+class XWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int),
+        ("depth", ctypes.c_int),
+        ("visual", ctypes.c_void_p),
+        ("root", Window),
+        ("class_", ctypes.c_int),
+        ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int),
+        ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong),
+        ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int),
+        ("colormap", Colormap),
+        ("map_installed", ctypes.c_int),
+        ("map_state", ctypes.c_int),
+        ("all_event_masks", ctypes.c_long),
+        ("your_event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int),
+        ("screen", ctypes.c_void_p),
+    ]
+
+
+IS_VIEWABLE = 2
+
+
 class XImage(ctypes.Structure):
     pass
 
@@ -298,6 +342,11 @@ xlib.XGetImage.argtypes = [
 xlib.XGetImage.restype = ctypes.POINTER(XImage)
 xlib.XDestroyImage.argtypes = [ctypes.POINTER(XImage)]
 
+xlib.XGetWindowAttributes.argtypes = [
+    ctypes.c_void_p, Window, ctypes.POINTER(XWindowAttributes),
+]
+xlib.XGetWindowAttributes.restype = ctypes.c_int
+
 xlib.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(XEvent)]
 xlib.XPending.argtypes = [ctypes.c_void_p]
 xlib.XPending.restype = ctypes.c_int
@@ -312,6 +361,47 @@ _ERROR_HANDLER_TYPE = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
 _error_handler = _ERROR_HANDLER_TYPE(lambda display, event: 0)
 xlib.XSetErrorHandler(_error_handler)
+
+
+class XShmSegmentInfo(ctypes.Structure):
+    _fields_ = [
+        ("shmseg", ctypes.c_ulong),
+        ("shmid", ctypes.c_int),
+        ("shmaddr", ctypes.c_char_p),
+        ("readOnly", ctypes.c_int),
+    ]
+
+
+IPC_PRIVATE = 0
+IPC_CREAT = 0o1000
+IPC_RMID = 0
+
+if xext is not None:
+    xext.XShmQueryExtension.argtypes = [ctypes.c_void_p]
+    xext.XShmQueryExtension.restype = ctypes.c_int
+    xext.XShmCreateImage.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int,
+        ctypes.c_char_p, ctypes.POINTER(XShmSegmentInfo), ctypes.c_uint,
+        ctypes.c_uint,
+    ]
+    xext.XShmCreateImage.restype = ctypes.POINTER(XImage)
+    xext.XShmAttach.argtypes = [ctypes.c_void_p,
+                                ctypes.POINTER(XShmSegmentInfo)]
+    xext.XShmDetach.argtypes = [ctypes.c_void_p,
+                                ctypes.POINTER(XShmSegmentInfo)]
+    xext.XShmPutImage.argtypes = [
+        ctypes.c_void_p, Window, ctypes.c_void_p, ctypes.POINTER(XImage),
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_int,
+    ]
+
+if libc is not None:
+    libc.shmget.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
+    libc.shmget.restype = ctypes.c_int
+    libc.shmat.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    libc.shmat.restype = ctypes.c_void_p
+    libc.shmdt.argtypes = [ctypes.c_void_p]
+    libc.shmctl.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
 
 
 class Display:
@@ -362,17 +452,33 @@ class Display:
         if actual_format.value == 32:
             width = ctypes.sizeof(ctypes.c_long)
         size = nitems.value * width
-        raw = bytes(bytearray(data[:size])) if size else b""
+
+        # string_at copies the block in one go. Slicing the ctypes pointer
+        # instead would build a Python list with one int per byte, which on a
+        # window shipping a megabyte of icons costs a third of a second.
+        raw = ctypes.string_at(ctypes.cast(data, ctypes.c_void_p), size) \
+            if size else b""
         xlib.XFree(data)
         return raw, actual_format.value, nitems.value
 
     def get_cardinals(self, window, name):
-        """A 32-bit CARDINAL/WINDOW/ATOM property as a list of ints."""
+        """A 32-bit CARDINAL/WINDOW/ATOM property, as an array of ints.
+
+        Returned as numpy rather than a list: `_NET_WM_ICON` can hold a
+        million entries, and building a Python list of those is slower than
+        everything else the switcher does put together.
+        """
         raw, fmt, count = self._property(window, name)
         if not raw or fmt != 32:
-            return []
-        longs = struct.unpack(f"{count}l", raw[:count * ctypes.sizeof(ctypes.c_long)])
-        return [v & 0xFFFFFFFFFFFFFFFF if v < 0 else v for v in longs]
+            return np.empty(0, dtype=np.uint64)
+
+        stride = ctypes.sizeof(ctypes.c_long)
+        usable = (len(raw) // stride) * stride
+        return np.frombuffer(raw[:usable], dtype=np.uint64)
+
+    def get_ints(self, window, name):
+        """The same, as a plain list. For properties known to be short."""
+        return self.get_cardinals(window, name).tolist()
 
     def get_text(self, window, name):
         """A UTF8_STRING or STRING property, decoded."""
@@ -385,11 +491,11 @@ class Display:
 
     def client_list(self):
         """Managed windows, bottom of the stack first."""
-        return self.get_cardinals(self.root, "_NET_CLIENT_LIST_STACKING") or \
-            self.get_cardinals(self.root, "_NET_CLIENT_LIST")
+        return (self.get_ints(self.root, "_NET_CLIENT_LIST_STACKING") or
+                self.get_ints(self.root, "_NET_CLIENT_LIST"))
 
     def active_window(self):
-        values = self.get_cardinals(self.root, "_NET_ACTIVE_WINDOW")
+        values = self.get_ints(self.root, "_NET_ACTIVE_WINDOW")
         return values[0] if values else 0
 
     def window_title(self, window):
@@ -397,18 +503,17 @@ class Display:
                 self.get_text(window, "WM_NAME"))
 
     def window_states(self, window):
-        return set(self.get_cardinals(window, "_NET_WM_STATE"))
+        return set(self.get_ints(window, "_NET_WM_STATE"))
 
     def window_types(self, window):
-        return set(self.get_cardinals(window, "_NET_WM_TYPE") or
-                   self.get_cardinals(window, "_NET_WM_WINDOW_TYPE"))
+        return set(self.get_ints(window, "_NET_WM_WINDOW_TYPE"))
 
     def window_desktop(self, window):
-        values = self.get_cardinals(window, "_NET_WM_DESKTOP")
+        values = self.get_ints(window, "_NET_WM_DESKTOP")
         return values[0] if values else -1
 
     def current_desktop(self):
-        values = self.get_cardinals(self.root, "_NET_CURRENT_DESKTOP")
+        values = self.get_ints(self.root, "_NET_CURRENT_DESKTOP")
         return values[0] if values else -1
 
     def window_icon(self, window, prefer=128):
@@ -419,34 +524,38 @@ class Display:
         pixels wide, else the largest available.
         """
         values = self.get_cardinals(window, "_NET_WM_ICON")
-        if not values:
+        if values.size < 3:
             return None
 
         best = None
-        i = 0
-        while i + 2 <= len(values):
-            w, h = values[i], values[i + 1]
-            i += 2
-            if w <= 0 or h <= 0 or i + w * h > len(values):
+        offset = 0
+        while offset + 2 <= values.size:
+            width = int(values[offset])
+            height = int(values[offset + 1])
+            offset += 2
+            if width <= 0 or height <= 0 or offset + width * height > values.size:
                 break
-            pixels = values[i:i + w * h]
-            i += w * h
+
+            block = values[offset:offset + width * height]
+            offset += width * height
 
             if best is None:
-                best = (w, h, pixels)
+                best = (width, height, block)
                 continue
-            bw = best[0]
-            if bw < prefer and w > bw:
-                best = (w, h, pixels)
-            elif w >= prefer and (bw < prefer or w < bw):
-                best = (w, h, pixels)
+            # The smallest icon that is still at least `prefer` wide, or the
+            # largest one on offer if none of them reach it.
+            current = best[0]
+            if current < prefer and width > current:
+                best = (width, height, block)
+            elif width >= prefer and (current < prefer or width < current):
+                best = (width, height, block)
 
         if best is None:
             return None
 
-        w, h, pixels = best
-        argb = np.array(pixels, dtype=np.uint64).astype(np.uint32).reshape(h, w)
-        image = np.empty((h, w, 4), dtype=np.uint8)
+        width, height, block = best
+        argb = block.astype(np.uint32).reshape(height, width)
+        image = np.empty((height, width, 4), dtype=np.uint8)
         image[..., 0] = (argb >> 16) & 0xFF     # R
         image[..., 1] = (argb >> 8) & 0xFF      # G
         image[..., 2] = argb & 0xFF             # B
@@ -566,13 +675,72 @@ class Canvas:
         # One buffer and one XImage for the life of the process: the screen
         # size does not change under us, and reusing them keeps opening the
         # switcher free of allocation.
-        self._buffer = np.zeros((self.height, self.width, 4), dtype=np.uint8)
+        self._shm = None
+        self._image = None
+        self._buffer = None
+        self._setup_image()
         self._buffer[..., 3] = 255
-        self._image = xlib.XCreateImage(
-            display.ptr, display.visual, display.depth, Z_PIXMAP, 0,
-            self._buffer.ctypes.data_as(ctypes.c_char_p),
-            self.width, self.height, 32, 0)
         self.mapped = False
+
+    def _setup_image(self):
+        """Prefer a shared-memory image; fall back to a normal one."""
+        if self._setup_shared_image():
+            return
+
+        self._buffer = np.zeros((self.height, self.width, 4), dtype=np.uint8)
+        self._image = xlib.XCreateImage(
+            self.display.ptr, self.display.visual, self.display.depth,
+            Z_PIXMAP, 0, self._buffer.ctypes.data_as(ctypes.c_char_p),
+            self.width, self.height, 32, 0)
+
+    def _setup_shared_image(self):
+        if xext is None or libc is None:
+            return False
+        if not xext.XShmQueryExtension(self.display.ptr):
+            return False
+
+        info = XShmSegmentInfo()
+        image = xext.XShmCreateImage(
+            self.display.ptr, self.display.visual, self.display.depth,
+            Z_PIXMAP, None, ctypes.byref(info), self.width, self.height)
+        if not image:
+            return False
+
+        size = image.contents.bytes_per_line * image.contents.height
+        info.shmid = libc.shmget(IPC_PRIVATE, size, IPC_CREAT | 0o600)
+        if info.shmid < 0:
+            xlib.XDestroyImage(image)
+            return False
+
+        address = libc.shmat(info.shmid, None, 0)
+        if address in (None, ctypes.c_void_p(-1).value):
+            libc.shmctl(info.shmid, IPC_RMID, None)
+            xlib.XDestroyImage(image)
+            return False
+
+        info.shmaddr = ctypes.cast(address, ctypes.c_char_p)
+        image.contents.data = address
+        info.readOnly = False
+
+        if not xext.XShmAttach(self.display.ptr, ctypes.byref(info)):
+            libc.shmdt(ctypes.c_void_p(address))
+            libc.shmctl(info.shmid, IPC_RMID, None)
+            xlib.XDestroyImage(image)
+            return False
+        self.display.sync()
+
+        # Marked for destruction now; the segment survives until both the
+        # server and this process detach, so nothing is leaked on a crash.
+        libc.shmctl(info.shmid, IPC_RMID, None)
+
+        buffer_type = ctypes.c_uint8 * size
+        raw = buffer_type.from_address(address)
+        stride = image.contents.bytes_per_line // 4
+        self._buffer = np.frombuffer(raw, dtype=np.uint8).reshape(
+            self.height, stride, 4)[:, :self.width]
+        self._image = image
+        self._shm = info
+        return True
 
     def set_frame(self, rgb):
         """Replace the whole frame with an RGB uint8 array of screen size."""
@@ -598,8 +766,12 @@ class Canvas:
         """Push part of the current frame to the server."""
         width = self.width if width is None else width
         height = self.height if height is None else height
-        xlib.XPutImage(self.display.ptr, self.window, self.gc, self._image,
-                       x, y, x, y, width, height)
+        if self._shm is not None:
+            xext.XShmPutImage(self.display.ptr, self.window, self.gc,
+                              self._image, x, y, x, y, width, height, False)
+        else:
+            xlib.XPutImage(self.display.ptr, self.window, self.gc, self._image,
+                           x, y, x, y, width, height)
         xlib.XFlush(self.display.ptr)
 
     def show(self):
@@ -619,22 +791,27 @@ class Canvas:
         if self.window:
             xlib.XDestroyWindow(self.display.ptr, self.window)
             self.window = 0
+        if self._shm is not None:
+            self._buffer = None
+            xext.XShmDetach(self.display.ptr, ctypes.byref(self._shm))
+            self.display.sync()
+            libc.shmdt(ctypes.c_void_p(
+                ctypes.cast(self._shm.shmaddr, ctypes.c_void_p).value))
+            self._shm = None
+
+    @property
+    def shared(self):
+        """Whether frames go through shared memory rather than the socket."""
+        return self._shm is not None
 
 
-def grab_screen(display):
-    """The current screen contents as an RGB array, or None if unreadable."""
-    image = xlib.XGetImage(
-        display.ptr, display.root, 0, 0, display.width, display.height,
-        0xFFFFFFFF, Z_PIXMAP)
-    if not image:
-        return None
-
+def _image_to_rgb(image):
+    """An XImage of 32-bit pixels as an RGB array, or None."""
     info = image.contents
-    if info.bits_per_pixel != 32:
+    if info.bits_per_pixel != 32 or info.width <= 0 or info.height <= 0:
         return None
 
-    size = info.bytes_per_line * info.height
-    raw = ctypes.string_at(info.data, size)
+    raw = ctypes.string_at(info.data, info.bytes_per_line * info.height)
     stride = info.bytes_per_line // 4
     pixels = np.frombuffer(raw, dtype=np.uint8).reshape(
         info.height, stride, 4)[:, :info.width]
@@ -644,3 +821,45 @@ def grab_screen(display):
     rgb[..., 1] = pixels[..., 1]
     rgb[..., 2] = pixels[..., 0]
     return rgb
+
+
+def grab_screen(display):
+    """The current screen contents as an RGB array, or None if unreadable."""
+    image = xlib.XGetImage(
+        display.ptr, display.root, 0, 0, display.width, display.height,
+        0xFFFFFFFF, Z_PIXMAP)
+    if not image:
+        return None
+    try:
+        return _image_to_rgb(image)
+    finally:
+        xlib.XDestroyImage(image)
+
+
+def capture_window(display, window):
+    """A window's own contents as an RGB array, or None.
+
+    Under a compositing window manager the server keeps the contents of every
+    mapped window, so this works even for windows buried behind others. Without
+    a compositor an obscured window has no stored contents and the result is
+    whatever happens to be on top of it, which is why the caller treats this as
+    best effort and falls back to the application icon.
+    """
+    attributes = XWindowAttributes()
+    if not xlib.XGetWindowAttributes(display.ptr, window,
+                                     ctypes.byref(attributes)):
+        return None
+    if attributes.map_state != IS_VIEWABLE:
+        return None
+    if attributes.width < 16 or attributes.height < 16:
+        return None
+
+    image = xlib.XGetImage(
+        display.ptr, window, 0, 0, attributes.width, attributes.height,
+        0xFFFFFFFF, Z_PIXMAP)
+    if not image:
+        return None
+    try:
+        return _image_to_rgb(image)
+    finally:
+        xlib.XDestroyImage(image)

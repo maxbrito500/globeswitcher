@@ -21,6 +21,10 @@ space, not a position on a flat circle, and which windows are visible falls out
 of the drawing order: the far half is drawn first, the globe on top of it, then
 the near half. A window crossing the limb is cut exactly at the silhouette
 without anyone having to test for it.
+
+Compositing is done in numpy rather than PIL. Every pixel of the animated
+region changes on every frame, and at 60 fps the conversions in and out of PIL
+images cost more than the drawing itself.
 """
 
 import math
@@ -32,18 +36,18 @@ from PIL import Image, ImageDraw, ImageFont
 from .globe import VIEW_TILT_RADIANS
 
 # Layout, as fractions of the screen's short axis.
-GLOBE_FRACTION = 0.40
-ITEM_FRACTION = 0.125
-ITEM_MIN = 72
-ITEM_MAX = 160
+GLOBE_FRACTION = 0.50
+ITEM_FRACTION = 0.145
+ITEM_MIN = 84
+ITEM_MAX = 190
 
 # The ring the windows ride on, in globe radii. It has to be wide enough that
 # ORBIT_RADIUS * sin(view tilt) > 1, or the window at the front projects inside
 # the globe's disc instead of standing clear of it.
-ORBIT_RADIUS = 1.75
+ORBIT_RADIUS = 1.80
 
 # How much nearer windows grow. This is what makes the turn read as three
-# dimensional rather than as icons sliding sideways.
+# dimensional rather than as thumbnails sliding sideways.
 DEPTH_SCALE = 0.18
 
 # Windows on the far side are mostly hidden by the globe; the sliver that
@@ -51,6 +55,8 @@ DEPTH_SCALE = 0.18
 BACK_OPACITY = 0.55
 
 BACKDROP_DIM = 0.34             # how much of the desktop's brightness remains
+
+BADGE_FRACTION = 0.34           # app icon badge, relative to the tile's height
 
 FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -69,23 +75,65 @@ def _load_font(size):
     return ImageFont.load_default()
 
 
+# --- compositing -------------------------------------------------------------
+
+
+def blend(canvas, rgb, alpha, x, y):
+    """Alpha-blend an RGB block into `canvas` at (x, y), clipped to it.
+
+    `alpha` is uint8 and the arithmetic is 16-bit integer. At these sizes the
+    round trip through float is the most expensive thing a frame would do.
+    """
+    height, width = rgb.shape[:2]
+    canvas_height, canvas_width = canvas.shape[:2]
+
+    sx, sy = max(0, -x), max(0, -y)
+    ex = min(width, canvas_width - x)
+    ey = min(height, canvas_height - y)
+    if ex <= sx or ey <= sy:
+        return
+
+    target = canvas[y + sy:y + ey, x + sx:x + ex]
+    source = rgb[sy:ey, sx:ex]
+    a = alpha[sy:ey, sx:ex, None]
+
+    # target + (source - target) * a / 255, in 32-bit integers. A difference
+    # times an alpha reaches 255 * 255, which overflows int16, and 8-bit
+    # channels are cheap enough to widen.
+    delta = source.astype(np.int32)
+    delta -= target
+    delta *= a
+    # Divide by 255 the exact way: (v + 128 + ((v + 128) >> 8)) >> 8.
+    delta += 128
+    delta += delta >> 8
+    delta >>= 8
+    delta += target
+    np.clip(delta, 0, 255, out=delta)
+    target[:] = delta.astype(np.uint8)
+
+
+def split_rgba(image):
+    """A PIL RGBA image as (contiguous RGB array, contiguous alpha array)."""
+    data = np.asarray(image, dtype=np.uint8)
+    return (np.ascontiguousarray(data[..., :3]),
+            np.ascontiguousarray(data[..., 3]))
+
+
+# --- geometry ----------------------------------------------------------------
+
+
 class Bead:
     """One window, placed in space at a given globe rotation."""
 
-    __slots__ = ("index", "x", "y", "depth", "size", "opacity")
+    __slots__ = ("index", "x", "y", "depth", "height", "opacity")
 
-    def __init__(self, index, x, y, depth, size, opacity):
+    def __init__(self, index, x, y, depth, height, opacity):
         self.index = index
         self.x = x                  # centre, in screen pixels
         self.y = y
         self.depth = depth          # > 0 towards the viewer
-        self.size = size
+        self.height = height        # box size; the tile keeps its own aspect
         self.opacity = opacity
-
-    @property
-    def box(self):
-        half = self.size // 2 + 1
-        return (self.x - half, self.y - half, self.x + half, self.y + half)
 
 
 class Layout:
@@ -101,8 +149,8 @@ class Layout:
         self.globe_diameter = int(short * GLOBE_FRACTION)
         self.globe_radius = self.globe_diameter / 2.0
 
-        # A crowded equator needs smaller beads or they smear into each other
-        # at the limbs, where they bunch up.
+        # A crowded ring needs smaller tiles, or they smear into each other at
+        # the limbs where the spacing foreshortens.
         crowding = 1.0 if self.count <= 8 else max(0.62, 8.0 / self.count)
         self.item_size = int(min(ITEM_MAX, max(
             ITEM_MIN, short * ITEM_FRACTION * crowding)))
@@ -117,46 +165,43 @@ class Layout:
         return int(self.item_size * (1.0 + DEPTH_SCALE))
 
     @property
-    def region(self):
-        """The rectangle the switcher ever draws in.
-
-        Fixed for the life of a popup: it is the globe, the whole ring at its
-        widest, and the title plate. Keeping it constant means the dimmed
-        backdrop under it can be prepared once instead of re-cropped every
-        frame.
-        """
-        cx, cy = self.centre
-        reach = self.max_item_size / 2 + 4
-        half_width = ORBIT_RADIUS * self.globe_radius + reach
-
-        left = cx - half_width
-        right = cx + half_width
-        top = cy - max(self.globe_radius, self.orbit_rise + reach)
-        bottom = max(cy + self.globe_radius,
-                     cy + self.orbit_rise + reach,
-                     self.title_top + self.title_height)
-
-        return (max(0, int(left)), max(0, int(top)),
-                min(self.width, int(right) + 1),
-                min(self.height, int(bottom) + 1))
-
-    @property
     def title_height(self):
-        return int(self.globe_diameter * 0.075) + 30
+        return int(self.globe_diameter * 0.062) + 30
 
     @property
     def title_top(self):
         """Where the title plate sits: below the globe and below the ring."""
         _, cy = self.centre
         clearance = max(self.globe_radius,
-                        self.orbit_rise + self.item_size * 0.75)
-        return int(cy + clearance + 18)
+                        self.orbit_rise + self.item_size * 0.60)
+        return int(cy + clearance + 16)
 
     @property
     def globe_box(self):
         cx, cy = self.centre
         half = self.globe_diameter // 2
         return (cx - half, cy - half, self.globe_diameter, self.globe_diameter)
+
+    @property
+    def region(self):
+        """The rectangle the switcher ever draws in.
+
+        Fixed for the life of a popup: the globe, the whole ring at its widest,
+        and the title plate. Keeping it constant means the dimmed backdrop
+        under it can be prepared once instead of re-cropped every frame.
+        """
+        cx, cy = self.centre
+        reach = self.max_item_size / 2 + 6
+        half_width = ORBIT_RADIUS * self.globe_radius + reach
+
+        top = cy - max(self.globe_radius, self.orbit_rise + reach)
+        bottom = max(cy + self.globe_radius,
+                     cy + self.orbit_rise + reach,
+                     self.title_top + self.title_height)
+
+        return (max(0, int(cx - half_width)), max(0, int(top)),
+                min(self.width, int(cx + half_width) + 1),
+                min(self.height, int(bottom) + 1))
 
     def longitude(self, index):
         """The fixed longitude a window is pinned to on the globe."""
@@ -188,51 +233,28 @@ class Layout:
             nz = cos_t * mz
 
             depth = nz
-            size = int(self.item_size * (1.0 + DEPTH_SCALE * depth / ORBIT_RADIUS))
+            height = int(self.item_size *
+                         (1.0 + DEPTH_SCALE * depth / ORBIT_RADIUS))
             opacity = 1.0 if depth >= 0 else BACK_OPACITY
 
             beads.append(Bead(
                 index,
                 int(cx + mx * self.globe_radius),
                 int(cy - ny * self.globe_radius),
-                depth, size, opacity))
+                depth, height, opacity))
 
         beads.sort(key=lambda bead: bead.depth)
         return beads
 
 
-class IconCache:
-    """Icons prescaled once, then reused at whatever size a frame asks for.
-
-    A roll only visits a few dozen distinct sizes, so after the first turn
-    every lookup is a hit and no frame pays for a resample.
-    """
-
-    QUANTUM = 4
-
-    def __init__(self, icons, titles, max_size):
-        self._sources = []
-        for icon, title in zip(icons, titles):
-            self._sources.append(
-                _trim(icon) if icon is not None else _letter_tile(title))
-        self._max_size = max_size
-        self._cache = {}
-
-    def get(self, index, size):
-        size = max(8, int(round(size / self.QUANTUM)) * self.QUANTUM)
-        key = (index, size)
-        tile = self._cache.get(key)
-        if tile is None:
-            tile = _fit_square(self._sources[index], size)
-            self._cache[key] = tile
-        return tile
+# --- tiles -------------------------------------------------------------------
 
 
 def _trim(icon):
     """Drop an icon's transparent padding.
 
     Application icons pad themselves by wildly different amounts, and without
-    trimming a ring of them looks assembled at random sizes.
+    trimming a row of them looks assembled at random sizes.
     """
     image = Image.fromarray(icon, "RGBA")
     box = image.getchannel("A").getbbox()
@@ -240,7 +262,7 @@ def _trim(icon):
 
 
 def _letter_tile(title):
-    """A stand-in tile for windows that ship no icon."""
+    """A stand-in for windows with neither a thumbnail nor an icon."""
     size = 256
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -253,19 +275,88 @@ def _letter_tile(title):
     return image
 
 
-def _fit_square(image, size):
-    """Scale into a `size` square, keeping the aspect ratio."""
-    scale = size / max(image.width, image.height)
+def _fit_box(image, width, height):
+    """Scale into a box, keeping the aspect ratio, centred on transparency."""
+    scale = min(width / image.width, height / image.height)
     scaled = image.resize(
         (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
         Image.LANCZOS)
-    if scaled.size == (size, size):
+    if scaled.size == (width, height):
         return scaled
 
-    square = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    square.paste(scaled, ((size - scaled.width) // 2,
-                          (size - scaled.height) // 2))
-    return square
+    box = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    box.paste(scaled, ((width - scaled.width) // 2,
+                       (height - scaled.height) // 2))
+    return box
+
+
+def _rounded_mask(size, radius):
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, size[0] - 1, size[1] - 1), radius=radius, fill=255)
+    return mask
+
+
+class TileFactory:
+    """Builds the tile drawn for each window, at whatever size a frame wants.
+
+    A roll only visits a few dozen distinct sizes, so after the first turn
+    every lookup is a cache hit and no frame pays to rescale anything.
+    """
+
+    QUANTUM = 4
+
+    def __init__(self, thumbnails, icons, titles):
+        self._thumbnails = thumbnails       # PIL RGB images, or None
+        self._icons = [
+            _trim(icon) if icon is not None else None for icon in icons]
+        self._fallbacks = [
+            self._icons[i] if self._icons[i] is not None else _letter_tile(title)
+            for i, title in enumerate(titles)]
+        self._cache = {}
+
+    def get(self, index, height):
+        """(RGB, alpha) for window `index`, drawn `height` pixels tall."""
+        height = max(16, int(round(height / self.QUANTUM)) * self.QUANTUM)
+        key = (index, height)
+        tile = self._cache.get(key)
+        if tile is None:
+            tile = split_rgba(self._build(index, height))
+            self._cache[key] = tile
+        return tile
+
+    def _build(self, index, height):
+        thumbnail = self._thumbnails[index]
+        if thumbnail is None:
+            return _fit_box(self._fallbacks[index], height, height)
+
+        # Fit the window's own shape inside the box, so a wide window reads as
+        # wide: that shape is half of recognising it at a glance.
+        scale = min(height / thumbnail.width, height / thumbnail.height)
+        width = max(24, round(thumbnail.width * scale))
+        tall = max(24, round(thumbnail.height * scale))
+
+        tile = thumbnail.resize((width, tall), Image.LANCZOS).convert("RGBA")
+        radius = max(4, int(min(width, tall) * 0.09))
+        tile.putalpha(_rounded_mask((width, tall), radius))
+
+        # A hairline edge stops pale window contents dissolving into the
+        # dimmed desktop behind them.
+        ImageDraw.Draw(tile).rounded_rectangle(
+            (0, 0, width - 1, tall - 1), radius=radius,
+            outline=(255, 255, 255, 90), width=2)
+
+        icon = self._icons[index]
+        if icon is not None:
+            badge = max(18, int(height * BADGE_FRACTION))
+            tile.alpha_composite(
+                icon.resize((badge, badge), Image.LANCZOS),
+                (width - badge - 3, tall - badge - 3))
+
+        return tile
+
+
+# --- frame -------------------------------------------------------------------
 
 
 def dim(rgb, factor=BACKDROP_DIM):
@@ -276,29 +367,32 @@ def dim(rgb, factor=BACKDROP_DIM):
 class Frame:
     """Draws a frame of the switcher over a fixed, already dimmed backdrop."""
 
-    def __init__(self, backdrop, layout, icons, titles):
-        self.backdrop = backdrop            # RGB uint8, screen sized
+    def __init__(self, backdrop, layout, thumbnails, icons, titles):
+        self.backdrop = backdrop            # RGB uint8, screen sized, as captured
         self.layout = layout
         self.titles = titles
-        self.icons = IconCache(
-            icons, titles,
-            int(layout.item_size * (1.0 + DEPTH_SCALE)))
-        self._title_font = _load_font(
-            max(15, int(layout.globe_diameter * 0.075)))
+        self.tiles = TileFactory(thumbnails, icons, titles)
 
+        # Only the region is ever drawn, so only the region is worth dimming;
+        # darkening the whole screen would cost more than rendering a frame.
         left, top, right, bottom = layout.region
         self._origin = (left, top)
-        self._base = Image.fromarray(
-            backdrop[top:bottom, left:right], "RGB").convert("RGBA")
+        self._base = dim(np.ascontiguousarray(backdrop[top:bottom, left:right]))
+        self._canvas = np.empty_like(self._base)
 
-    # -- drawing --------------------------------------------------------------
+        self._title_font = _load_font(
+            max(15, int(layout.globe_diameter * 0.062)))
+        self._title_cache = {}
+        self._highlight_cache = {}
 
     def render(self, rotation, selected, globe_rgb, globe_alpha):
         """Compose one frame. Returns (RGB block, x, y) ready to blit."""
         layout = self.layout
         beads = layout.orbit(rotation)
         left, top = self._origin
-        canvas = self._base.copy()
+
+        canvas = self._canvas
+        np.copyto(canvas, self._base)
 
         # Far half, then the globe, then the near half. The globe is opaque
         # inside its disc, so it cuts the far half at the silhouette.
@@ -306,85 +400,89 @@ class Frame:
             if bead.depth < 0:
                 self._draw_bead(canvas, bead, selected, left, top)
 
-        self._draw_globe(canvas, globe_rgb, globe_alpha, left, top)
+        gx, gy, _, _ = layout.globe_box
+        blend(canvas, globe_rgb, globe_alpha, gx - left, gy - top)
 
         for bead in beads:
             if bead.depth >= 0:
                 self._draw_bead(canvas, bead, selected, left, top)
 
-        self._draw_title(canvas, self.titles[selected], left, top)
-
-        block = np.asarray(canvas.convert("RGB"), dtype=np.uint8)
-        return block, left, top
-
-    def _draw_globe(self, canvas, globe_rgb, globe_alpha, left, top):
-        gx, gy, gw, gh = self.layout.globe_box
-        rgba = np.empty((gh, gw, 4), dtype=np.uint8)
-        rgba[..., :3] = globe_rgb
-        rgba[..., 3] = (globe_alpha * 255).astype(np.uint8)
-        canvas.alpha_composite(
-            Image.fromarray(rgba, "RGBA"), (gx - left, gy - top))
+        self._draw_title(canvas, selected, left, top)
+        return canvas, left, top
 
     def _draw_bead(self, canvas, bead, selected, left, top):
-        tile = self.icons.get(bead.index, bead.size)
-        size = tile.width
-        x = bead.x - size // 2 - left
-        y = bead.y - size // 2 - top
+        rgb, alpha = self.tiles.get(bead.index, bead.height)
+        height, width = rgb.shape[:2]
+        x = bead.x - width // 2 - left
+        y = bead.y - height // 2 - top
 
         if bead.index == selected:
-            self._draw_highlight(canvas, x, y, size)
+            glow_rgb, glow_alpha, pad = self._highlight(width, height)
+            blend(canvas, glow_rgb, glow_alpha, x - pad, y - pad)
 
         if bead.opacity < 1.0:
-            faded = tile.copy()
-            faded.putalpha(faded.getchannel("A").point(
-                lambda value: int(value * bead.opacity)))
-            tile = faded
+            alpha = (alpha.astype(np.uint16) *
+                     int(bead.opacity * 256) >> 8).astype(np.uint8)
 
-        canvas.alpha_composite(tile, (x, y))
+        blend(canvas, rgb, alpha, x, y)
 
-    def _draw_highlight(self, canvas, x, y, size):
-        """A soft halo behind the window at the front."""
-        pad = int(size * 0.22)
-        glow = Image.new("RGBA", (size + pad * 2, size + pad * 2), (0, 0, 0, 0))
+    def _highlight(self, width, height):
+        """A soft halo behind the window at the front, cached per size."""
+        cached = self._highlight_cache.get((width, height))
+        if cached is not None:
+            return cached
+
+        pad = int(min(width, height) * 0.20)
+        glow = Image.new("RGBA", (width + pad * 2, height + pad * 2),
+                         (0, 0, 0, 0))
         draw = ImageDraw.Draw(glow)
+        radius = max(6, int(min(width, height) * 0.12))
 
         steps = 6
         for step in range(steps, 0, -1):
             inset = int(pad * (step - 1) / steps)
-            alpha = int(26 * (steps - step + 1) / steps)
+            alpha = int(30 * (steps - step + 1) / steps)
             draw.rounded_rectangle(
                 (inset, inset, glow.width - 1 - inset, glow.height - 1 - inset),
-                radius=int(size * 0.24), fill=(130, 180, 255, alpha))
+                radius=radius + pad - inset, fill=(130, 180, 255, alpha))
 
         draw.rounded_rectangle(
-            (pad - 3, pad - 3, glow.width - pad + 2, glow.height - pad + 2),
-            radius=int(size * 0.20), outline=(255, 255, 255, 235), width=3)
+            (pad - 4, pad - 4, glow.width - pad + 3, glow.height - pad + 3),
+            radius=radius + 4, outline=(255, 255, 255, 240), width=3)
 
-        canvas.alpha_composite(glow, (x - pad, y - pad))
+        rgb, alpha = split_rgba(glow)
+        cached = (rgb, alpha, pad)
+        self._highlight_cache[(width, height)] = cached
+        return cached
 
-    def _draw_title(self, canvas, title, left, top):
-        if not title:
+    def _draw_title(self, canvas, selected, left, top):
+        if selected >= len(self.titles) or not self.titles[selected]:
             return
 
-        layout = self.layout
-        cx, cy = layout.centre
-        draw = ImageDraw.Draw(canvas)
+        plate = self._title_cache.get(selected)
+        if plate is None:
+            plate = self._build_title(self.titles[selected])
+            self._title_cache[selected] = plate
 
+        rgb, alpha, width = plate
+        cx, _ = self.layout.centre
+        blend(canvas, rgb, alpha,
+              cx - width // 2 - left, self.layout.title_top - top)
+
+    def _build_title(self, title):
         text = title if len(title) <= 90 else title[:89] + "…"
-        box = draw.textbbox((0, 0), text, font=self._title_font)
+        measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        box = measure.textbbox((0, 0), text, font=self._title_font)
         text_width, text_height = box[2] - box[0], box[3] - box[1]
 
-        pad_x, pad_y = 16, 9
-        plate_top = layout.title_top - top
-        plate_left = cx - text_width // 2 - left
+        pad_x, pad_y = 18, 10
+        plate = Image.new("RGBA", (text_width + pad_x * 2,
+                                   text_height + pad_y * 2), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(plate)
+        draw.rounded_rectangle((0, 0, plate.width - 1, plate.height - 1),
+                               radius=11, fill=(0, 0, 0, 190))
+        draw.text((plate.width // 2, pad_y - box[1]), text,
+                  font=self._title_font, fill=(255, 255, 255, 255), anchor="ma")
 
-        plate = Image.new(
-            "RGBA", (text_width + pad_x * 2, text_height + pad_y * 2),
-            (0, 0, 0, 0))
-        ImageDraw.Draw(plate).rounded_rectangle(
-            (0, 0, plate.width - 1, plate.height - 1), radius=10,
-            fill=(0, 0, 0, 185))
-        canvas.alpha_composite(plate, (plate_left - pad_x, plate_top - pad_y))
-
-        draw.text((cx - left, plate_top - box[1]), text, font=self._title_font,
-                  fill=(255, 255, 255, 255), anchor="ma")
+        rgb, alpha = split_rgba(plate)
+        return rgb, alpha, plate.width

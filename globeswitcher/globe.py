@@ -37,7 +37,7 @@ TEXTURE_PATH = os.path.join(
 # never more than a few minutes stale.
 MAX_TEXTURE_AGE_SECONDS = 600
 
-VIEW_TILT_RADIANS = 0.62        # look down on the globe from ~35 degrees
+VIEW_TILT_RADIANS = 0.70        # look down on the globe from ~40 degrees
 ATMOSPHERE_RGB = (0.32, 0.55, 0.95)
 ATMOSPHERE_STRENGTH = 0.45
 RIM_START = 0.72                # fraction of the radius where the rim begins
@@ -89,18 +89,33 @@ class Globe:
 
         self._inside = inside
         self._row = ((0.5 - latitude / math.pi))    # 0 at north pole, 1 at south
-        self._turn = (longitude / (2.0 * math.pi) + 0.5).astype(np.float32)
+        self._turn = (longitude / (2.0 * math.pi) + 0.5).astype(np.float64)
 
         # Shading: an atmospheric rim near the limb, and a soft outer edge so
         # the globe does not look like a cut-out circle.
         rim = np.clip((radius - RIM_START) / (1.0 - RIM_START), 0.0, 1.0)
         self._rim = (rim * rim * ATMOSPHERE_STRENGTH).astype(np.float32)
+        # Coverage of the disc, as the 8-bit alpha the compositor blends with.
         edge = np.clip((1.0 - radius) * self.diameter / 2.0, 0.0, 1.0)
-        self.alpha = np.where(inside, edge, 0.0).astype(np.float32)
+        self.alpha = np.ascontiguousarray(
+            (np.where(inside, edge, 0.0) * 255).astype(np.uint8))
 
         self._flat_inside = np.flatnonzero(inside)
         self._turn_inside = self._turn.ravel()[self._flat_inside]
-        self._rim_inside = self._rim.ravel()[self._flat_inside]
+
+        # The atmospheric rim only touches the outer part of the disc, so it
+        # is applied to those pixels alone rather than to the whole sphere.
+        rim_flat = self._rim.ravel()[self._flat_inside]
+        lit = rim_flat > 0.004
+        self._rim_positions = self._flat_inside[lit]
+        self._rim_alpha = (rim_flat[lit] * 255).astype(np.int32)[:, None]
+        self._rim_tint = (np.array(ATMOSPHERE_RGB, dtype=np.float32) * 255
+                          ).astype(np.int32)[None, :]
+
+        # Reused every frame so a render allocates nothing.
+        self._out = np.zeros((self.diameter, self.diameter, 3), dtype=np.uint8)
+        self._columns = np.empty(self._flat_inside.size, dtype=np.int32)
+        self._samples = np.empty((self._flat_inside.size, 3), dtype=np.uint8)
 
     # -- texture --------------------------------------------------------------
 
@@ -121,10 +136,20 @@ class Globe:
             return self._map is not None
 
         self._map_mtime = mtime
-        height = self._map.shape[0]
-        self._row_index = np.clip(
+        height, width = self._map.shape[:2]
+
+        # Everything the render loop needs, in the form it needs it: the map
+        # as a flat list of pixels, and per-disc-pixel the start of its row
+        # and its column at zero rotation. A frame is then an integer add and
+        # one gather.
+        self._map_flat = self._map.reshape(-1, 3)
+        rows = np.clip(
             (self._row.ravel()[self._flat_inside] * height).astype(np.int32),
             0, height - 1)
+        self._row_offset = rows * width
+        self._column_base = np.mod(
+            (self._turn_inside * width).astype(np.int64), width
+        ).astype(np.int32)
         return True
 
     def refresh_if_stale(self, generator):
@@ -157,23 +182,35 @@ class Globe:
     # -- rendering ------------------------------------------------------------
 
     def render(self, rotation):
-        """The globe at `rotation` radians, as an RGB uint8 array."""
-        out = np.zeros((self.diameter, self.diameter, 3), dtype=np.uint8)
+        """The globe at `rotation` radians, as an RGB uint8 array.
+
+        The result is a buffer reused between frames; copy it if you need to
+        keep one.
+        """
+        out = self._out
         if self._map is None:
             return out
 
         width = self._map.shape[1]
-        turn = self._turn_inside + rotation / (2.0 * math.pi)
-        columns = (np.modf(turn)[0] * width).astype(np.int32)
-        np.mod(columns, width, out=columns)
 
-        samples = self._map[self._row_index, columns].astype(np.float32)
+        # Rotation is a whole-column shift of the map. Working in columns
+        # rather than radians keeps the whole frame in integers, and the
+        # 1/width of a turn it quantises to is far below one pixel of motion.
+        shift = int(rotation / (2.0 * math.pi) * width) % width
 
-        # Blend towards the atmosphere colour near the limb.
-        rim = self._rim_inside[:, None]
-        tint = np.array(ATMOSPHERE_RGB, dtype=np.float32) * 255.0
-        samples += (tint - samples) * rim
+        columns = self._columns
+        np.add(self._column_base, shift, out=columns)
+        np.subtract(columns, width, out=columns, where=columns >= width)
+
+        np.take(self._map_flat, self._row_offset + columns, axis=0,
+                out=self._samples)
 
         flat = out.reshape(-1, 3)
-        flat[self._flat_inside] = samples.astype(np.uint8)
+        flat[self._flat_inside] = self._samples
+
+        # Blend towards the atmosphere colour near the limb.
+        rim = flat[self._rim_positions].astype(np.int32)
+        rim += ((self._rim_tint - rim) * self._rim_alpha) >> 8
+        flat[self._rim_positions] = rim.astype(np.uint8)
+
         return out
