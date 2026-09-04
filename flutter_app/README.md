@@ -1,8 +1,9 @@
 # globeswitcher, in Flutter
 
-A rewrite of the switcher with Flutter doing the drawing, so the same interface
-can eventually run on more than X11. It is not a replacement yet — the Python
-app in the parent directory is still the one that gets installed.
+The switcher itself: this is what `../install.sh` builds and installs. Flutter
+does the drawing, so the same interface can eventually run on more than X11.
+The Python implementation in the parent directory came first and is kept as the
+reference the port was made from.
 
 ## What Flutter carries across, and what it does not
 
@@ -47,16 +48,28 @@ On this machine builds go through the machine-wide lock:
 ./build/linux/x64/release/bundle/globeswitcher
 ```
 
-Only one program can hold the Alt+Tab grab, so stop the Python daemon first, or
-neither will get the key:
+Only one program can hold the Alt+Tab grab, so stop anything else that has it
+first, or neither will get the key:
 
 ```sh
-pkill -f globeswitcher.__main__
+pkill -f globeswitcher.__main__          # the Python daemon
 ```
+
+## Layout
+
+    lib/backend/window_backend.dart   what the switcher needs from an OS
+    lib/backend/x11/                  the X11 implementation, in dart:ffi
+    lib/model/solar.dart              where the sun is, from the clock
+    lib/model/settings.dart           the tuning, saved and loaded
+    lib/ui/ring.dart                  the ring geometry
+    lib/ui/globe_shader.dart          feeding the shader
+    lib/ui/switcher_view.dart         painting a frame
+    lib/ui/settings_page.dart         the panel behind the tray icon
+    shaders/globe.frag                projection and lighting
+    linux/runner/my_application.cc    overlay and settings window modes
 
 ## What is not done yet
 
-- No installer and no autostart; it is started by hand.
 - Thumbnails are captured on every open, without the Python version's cache, so
   opening costs more than it needs to.
 - The overlay is an ordinary window kept above the others and fullscreened,

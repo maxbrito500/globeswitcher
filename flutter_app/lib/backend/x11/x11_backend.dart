@@ -74,6 +74,10 @@ class X11Backend implements WindowBackend {
   final StreamController<SwitcherKey> _keys = StreamController.broadcast();
   final StreamController<void> _released = StreamController.broadcast();
 
+  /// Whether windows on other workspaces are offered. The settings panel
+  /// writes this; the default matches what most desktops do.
+  bool currentDesktopOnly = true;
+
   void Function({required bool backwards})? _onShortcut;
   Timer? _pump;
   bool _keyboardHeld = false;
@@ -199,6 +203,8 @@ class X11Backend implements WindowBackend {
     for (final name in _skippedTypes) {
       if (types.contains(_atom(name))) return false;
     }
+
+    if (!currentDesktopOnly) return true;
 
     final desktop = _cardinals(id, '_NET_WM_DESKTOP');
     final current = _cardinals(_root, '_NET_CURRENT_DESKTOP');

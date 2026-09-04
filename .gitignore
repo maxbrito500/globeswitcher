@@ -9,3 +9,4 @@ flutter_app/build/
 flutter_app/.dart_tool/
 flutter_app/linux/flutter/ephemeral/
 !flutter_app/assets/*.jpg
+!flutter_app/assets/*.png

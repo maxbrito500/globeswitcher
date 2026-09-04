@@ -24,6 +24,39 @@ G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
 // screen before Alt is pressed would be in the way of everything.
 static void first_frame_cb(MyApplication* self, FlView* view) {}
 
+// The one window wears two hats. As the switcher it is an undecorated
+// fullscreen overlay above everything; as the settings panel it is an ordinary
+// window with a title bar. Flutter desktop gives an application a single
+// window, so it is reconfigured rather than duplicated.
+static void apply_overlay_mode(GtkWindow* window) {
+  gtk_widget_hide(GTK_WIDGET(window));
+  gtk_window_set_decorated(window, FALSE);
+  gtk_window_set_resizable(window, FALSE);
+  gtk_window_set_skip_taskbar_hint(window, TRUE);
+  gtk_window_set_skip_pager_hint(window, TRUE);
+  gtk_window_set_keep_above(window, TRUE);
+  gtk_window_set_type_hint(window, GDK_WINDOW_TYPE_HINT_SPLASHSCREEN);
+  gtk_window_fullscreen(window);
+  gtk_widget_show(GTK_WIDGET(window));
+  gtk_window_present(window);
+}
+
+static void apply_settings_mode(GtkWindow* window) {
+  gtk_widget_hide(GTK_WIDGET(window));
+  gtk_window_unfullscreen(window);
+  gtk_window_set_keep_above(window, FALSE);
+  gtk_window_set_type_hint(window, GDK_WINDOW_TYPE_HINT_NORMAL);
+  gtk_window_set_skip_taskbar_hint(window, FALSE);
+  gtk_window_set_skip_pager_hint(window, FALSE);
+  gtk_window_set_decorated(window, TRUE);
+  gtk_window_set_resizable(window, TRUE);
+  gtk_window_set_default_size(window, 760, 820);
+  gtk_window_resize(window, 760, 820);
+  gtk_window_set_position(window, GTK_WIN_POS_CENTER);
+  gtk_widget_show(GTK_WIDGET(window));
+  gtk_window_present(window);
+}
+
 static void window_method_call_cb(FlMethodChannel* channel,
                                   FlMethodCall* method_call,
                                   gpointer user_data) {
@@ -31,14 +64,17 @@ static void window_method_call_cb(FlMethodChannel* channel,
   const gchar* method = fl_method_call_get_name(method_call);
   g_autoptr(FlMethodResponse) response = nullptr;
 
-  if (g_strcmp0(method, "show") == 0) {
-    if (self->window != nullptr) {
-      gtk_widget_show(GTK_WIDGET(self->window));
-      gtk_window_present(self->window);
-    }
-    response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
-  } else if (g_strcmp0(method, "hide") == 0) {
-    if (self->window != nullptr) {
+  if (g_strcmp0(method, "setMode") == 0 && self->window != nullptr) {
+    FlValue* args = fl_method_call_get_args(method_call);
+    const gchar* mode = fl_value_get_type(args) == FL_VALUE_TYPE_STRING
+                            ? fl_value_get_string(args)
+                            : "hidden";
+
+    if (g_strcmp0(mode, "overlay") == 0) {
+      apply_overlay_mode(self->window);
+    } else if (g_strcmp0(mode, "settings") == 0) {
+      apply_settings_mode(self->window);
+    } else {
       gtk_widget_hide(GTK_WIDGET(self->window));
     }
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));

@@ -9,11 +9,9 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
+import '../model/settings.dart';
 import 'globe_shader.dart';
 import 'ring.dart';
-
-/// How much of the desktop's brightness is left behind the switcher.
-const double backdropDim = 0.34;
 
 /// The application icon badged on a thumbnail, relative to the tile's height.
 const double badgeFraction = 0.34;
@@ -35,6 +33,7 @@ class SwitcherPainter extends CustomPainter {
     required this.selected,
     required this.globe,
     required this.when,
+    required this.settings,
   });
 
   final ui.Image? backdrop;
@@ -44,13 +43,14 @@ class SwitcherPainter extends CustomPainter {
   final int selected;
   final GlobeShader globe;
   final DateTime when;
+  final SwitcherSettings settings;
 
   @override
   void paint(Canvas canvas, Size size) {
     _paintBackdrop(canvas, size);
     if (tiles.isEmpty) return;
 
-    final layout = RingLayout(size, tiles.length);
+    final layout = RingLayout(size, tiles.length, settings.ringConfig);
     final beads = layout.beads(rotation);
 
     // Far half, then the globe, then the near half: the globe is opaque
@@ -77,7 +77,9 @@ class SwitcherPainter extends CustomPainter {
           area,
           Paint());
       canvas.drawRect(
-          area, Paint()..color = Colors.black.withValues(alpha: 1 - backdropDim));
+          area,
+          Paint()
+            ..color = Colors.black.withValues(alpha: 1 - settings.backdropDim));
     } else {
       canvas.drawRect(area, Paint()..color = const Color(0xFF0B0D13));
     }
@@ -86,7 +88,12 @@ class SwitcherPainter extends CustomPainter {
   void _paintGlobe(Canvas canvas, RingLayout layout) {
     final rect = layout.globeRect;
     final shader = globe.shaderFor(
-        rect: rect, rotation: rotation + meridian, when: when);
+      rect: rect,
+      rotation: rotation + meridian,
+      when: when,
+      tilt: settings.viewTiltRadians,
+      nightAmbient: settings.nightAmbient,
+    );
     canvas.drawRect(rect, Paint()..shader = shader);
   }
 
@@ -149,6 +156,7 @@ class SwitcherPainter extends CustomPainter {
   }
 
   void _paintTitle(Canvas canvas, RingLayout layout) {
+    if (!settings.showTitles) return;
     if (selected < 0 || selected >= tiles.length) return;
     final title = tiles[selected].title;
     if (title.isEmpty) return;
@@ -180,5 +188,6 @@ class SwitcherPainter extends CustomPainter {
       old.rotation != rotation ||
       old.selected != selected ||
       old.tiles != tiles ||
-      old.backdrop != backdrop;
+      old.backdrop != backdrop ||
+      old.settings != settings;
 }

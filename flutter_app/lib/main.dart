@@ -5,64 +5,77 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:tray_manager/tray_manager.dart';
 
 import 'backend/window_backend.dart';
 import 'backend/x11/x11_backend.dart';
+import 'model/settings.dart';
 import 'model/solar.dart';
 import 'ui/globe_shader.dart';
 import 'ui/ring.dart';
+import 'ui/settings_page.dart';
 import 'ui/switcher_view.dart';
 
-/// How long the globe takes to roll one window round to the front, and the cap
-/// for the long wrap from the last window back to the first.
-const Duration rollDuration = Duration(milliseconds: 260);
+/// The cap on a long roll: wrapping from the last window back to the first
+/// travels the whole band, and should read as a turn rather than a jump.
 const Duration rollDurationMax = Duration(milliseconds: 620);
 
-/// Thumbnails are decoded at this size; bigger than they are ever drawn, small
+/// Thumbnails are decoded at this size: bigger than they are ever drawn, small
 /// enough that a screenful of windows does not become a screenful of textures.
 const int thumbnailLongEdge = 640;
 
-/// Asks the native runner to put the overlay on screen, or take it away.
+/// Asks the native runner to be an overlay, a settings window, or nothing.
 const MethodChannel _windowChannel = MethodChannel('globeswitcher/window');
+
+enum AppMode { hidden, overlay, settings }
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  final settings = SwitcherSettings();
+  await settings.load();
   final globe = await GlobeShader.load();
-  runApp(GlobeSwitcherApp(globe: globe));
+  runApp(GlobeSwitcherApp(globe: globe, settings: settings));
 }
 
 class GlobeSwitcherApp extends StatelessWidget {
-  const GlobeSwitcherApp({super.key, required this.globe});
+  const GlobeSwitcherApp(
+      {super.key, required this.globe, required this.settings});
 
   final GlobeShader globe;
+  final SwitcherSettings settings;
 
   @override
   Widget build(BuildContext context) => MaterialApp(
         debugShowCheckedModeBanner: false,
-        home: Scaffold(
-          backgroundColor: Colors.transparent,
-          body: SwitcherOverlay(globe: globe),
+        title: 'globeswitcher',
+        theme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+              seedColor: const Color(0xFF2E6FD8), brightness: Brightness.dark),
+          useMaterial3: true,
         ),
+        home: SwitcherHome(globe: globe, settings: settings),
       );
 }
 
-class SwitcherOverlay extends StatefulWidget {
-  const SwitcherOverlay({super.key, required this.globe});
+class SwitcherHome extends StatefulWidget {
+  const SwitcherHome({super.key, required this.globe, required this.settings});
 
   final GlobeShader globe;
+  final SwitcherSettings settings;
 
   @override
-  State<SwitcherOverlay> createState() => _SwitcherOverlayState();
+  State<SwitcherHome> createState() => _SwitcherHomeState();
 }
 
-class _SwitcherOverlayState extends State<SwitcherOverlay>
-    with SingleTickerProviderStateMixin {
-  WindowBackend? _backend;
+class _SwitcherHomeState extends State<SwitcherHome>
+    with SingleTickerProviderStateMixin, TrayListener {
+  X11Backend? _backend;
   StreamSubscription<SwitcherKey>? _keySubscription;
   StreamSubscription<void>? _releaseSubscription;
 
@@ -73,35 +86,111 @@ class _SwitcherOverlayState extends State<SwitcherOverlay>
   List<SwitcherTile> _tiles = const [];
   ui.Image? _backdrop;
 
-  bool _open = false;
+  AppMode _mode = AppMode.hidden;
   int _selected = 0;
   double _rotation = 0;
   double _rollFrom = 0;
   double _rollTo = 0;
   double _meridian = localMeridian();
+  Size _lastSize = const Size(1920, 1080);
+
+  SwitcherSettings get _settings => widget.settings;
 
   @override
   void initState() {
     super.initState();
+    _settings.addListener(_onSettingsChanged);
+    _setUpTray();
+
     final backend = X11Backend.open();
     if (backend == null) {
       debugPrint('globeswitcher: no X display; nothing to switch');
       return;
     }
     _backend = backend;
+    backend.currentDesktopOnly = _settings.currentWorkspaceOnly;
     backend.grabSwitcherShortcut(({required bool backwards}) {
-      unawaited(_show(backwards: backwards));
+      unawaited(_open(backwards: backwards));
     });
     _keySubscription = backend.keys.listen(_onKey);
     _releaseSubscription = backend.modifiersReleased.listen((_) => _accept());
   }
 
-  // -- opening and closing ----------------------------------------------------
+  void _onSettingsChanged() {
+    _backend?.currentDesktopOnly = _settings.currentWorkspaceOnly;
+    if (mounted) setState(() {});
+  }
 
-  Future<void> _show({required bool backwards}) async {
+  // -- tray -------------------------------------------------------------------
+
+  Future<void> _setUpTray() async {
+    // The bundle keeps its assets next to the executable, and the tray wants a
+    // path on disk rather than an asset key.
+    final root = File(Platform.resolvedExecutable).parent.path;
+    final icon = '$root/data/flutter_assets/assets/tray_globe.png';
+
+    trayManager.addListener(this);
+    try {
+      await trayManager.setIcon(icon);
+      await trayManager.setContextMenu(Menu(items: [
+        MenuItem(key: 'settings', label: 'Settings…'),
+        MenuItem.separator(),
+        MenuItem(key: 'quit', label: 'Quit'),
+      ]));
+    } catch (error) {
+      debugPrint('globeswitcher: no tray icon ($error)');
+    }
+
+    // Not every platform implements a tooltip, and it is not worth losing the
+    // icon over.
+    try {
+      await trayManager.setToolTip('globeswitcher');
+    } catch (_) {}
+  }
+
+  @override
+  void onTrayIconMouseDown() => unawaited(_showSettings());
+
+  @override
+  void onTrayIconRightMouseDown() => unawaited(trayManager.popUpContextMenu());
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) {
+    switch (menuItem.key) {
+      case 'settings':
+        unawaited(_showSettings());
+      case 'quit':
+        unawaited(_quit());
+    }
+  }
+
+  Future<void> _quit() async {
+    await trayManager.destroy();
+    _backend?.dispose();
+    exit(0);
+  }
+
+  // -- window modes -----------------------------------------------------------
+
+  Future<void> _setMode(AppMode mode) async {
+    if (mounted) setState(() => _mode = mode);
+    await _windowChannel.invokeMethod<void>('setMode', mode.name);
+  }
+
+  Future<void> _showSettings() async {
+    if (_mode == AppMode.overlay) return;
+    await _setMode(AppMode.settings);
+  }
+
+  Future<void> _hideSettings() async => _setMode(AppMode.hidden);
+
+  // -- the switcher -----------------------------------------------------------
+
+  Future<void> _open({required bool backwards}) async {
     final backend = _backend;
-    if (backend == null || _open) {
-      if (_open) _step(backwards ? -1 : 1);
+    if (backend == null) return;
+    if (_mode == AppMode.overlay) {
+      _step(backwards ? -1 : 1);
       return;
     }
 
@@ -116,7 +205,8 @@ class _SwitcherOverlayState extends State<SwitcherOverlay>
       final shot = backend.captureWindow(window.id);
       tiles.add(SwitcherTile(
         title: window.title,
-        thumbnail: shot == null ? null : await _decode(shot, longEdge: thumbnailLongEdge),
+        thumbnail:
+            shot == null ? null : await _decode(shot, longEdge: thumbnailLongEdge),
         icon: window.iconRgba == null
             ? null
             : await _decode(WindowShot(
@@ -129,48 +219,46 @@ class _SwitcherOverlayState extends State<SwitcherOverlay>
       _tiles = tiles;
       _backdrop = backdrop;
       _meridian = localMeridian();
-      _open = true;
       _selected = 0;
       _rotation = 0;
     });
 
-    await _windowChannel.invokeMethod<void>('show');
+    await _setMode(AppMode.overlay);
     if (!backend.grabKeyboard()) {
-      await _hide();
+      await _close();
       return;
     }
     _step(backwards ? -1 : 1);
   }
 
-  Future<void> _hide() async {
+  Future<void> _close() async {
     _backend?.releaseKeyboard();
     _roll.stop();
     setState(() {
-      _open = false;
       _tiles = const [];
       _windows = const [];
       _backdrop = null;
     });
-    await _windowChannel.invokeMethod<void>('hide');
+    await _setMode(AppMode.hidden);
   }
 
   void _accept() {
-    if (!_open) return;
+    if (_mode != AppMode.overlay) return;
     final chosen = _selected < _windows.length ? _windows[_selected] : null;
-    unawaited(_hide().then((_) {
+    unawaited(_close().then((_) {
       if (chosen != null) _backend?.activateWindow(chosen.id);
     }));
   }
 
   void _onKey(SwitcherKey key) {
-    if (!_open) return;
+    if (_mode != AppMode.overlay) return;
     switch (key) {
       case SwitcherKey.next:
         _step(1);
       case SwitcherKey.previous:
         _step(-1);
       case SwitcherKey.cancel:
-        unawaited(_hide());
+        unawaited(_close());
       case SwitcherKey.accept:
         _accept();
       case SwitcherKey.closeWindow:
@@ -181,42 +269,41 @@ class _SwitcherOverlayState extends State<SwitcherOverlay>
   void _closeSelected() {
     if (_selected >= _windows.length) return;
     _backend?.closeWindow(_windows[_selected].id);
+
     final windows = List<WindowInfo>.from(_windows)..removeAt(_selected);
     final tiles = List<SwitcherTile>.from(_tiles)..removeAt(_selected);
     if (windows.isEmpty) {
-      unawaited(_hide());
+      unawaited(_close());
       return;
     }
     setState(() {
       _windows = windows;
       _tiles = tiles;
       _selected = _selected.clamp(0, windows.length - 1);
-      _rotation = RingLayout(_lastSize, windows.length).longitude(_selected);
+      _rotation = RingLayout(_lastSize, windows.length, _settings.ringConfig)
+          .longitude(_selected);
     });
   }
 
   // -- rolling ----------------------------------------------------------------
 
-  Size _lastSize = const Size(1920, 1080);
-
   void _step(int delta) {
     if (_windows.length < 2) return;
-    final count = _windows.length;
-    final layout = RingLayout(_lastSize, count);
+    final layout =
+        RingLayout(_lastSize, _windows.length, _settings.ringConfig);
 
-    setState(() => _selected = (_selected + delta) % count);
+    setState(() => _selected = (_selected + delta) % _windows.length);
 
     // Retarget from wherever the globe is now, so a Tab pressed mid-roll stays
     // smooth instead of queueing up behind the last one.
-    final target = layout.longitude(_selected);
     _rollFrom = _rotation;
-    _rollTo = _rotation + shortestTurn(target - _rotation);
+    _rollTo = _rotation +
+        shortestTurn(layout.longitude(_selected) - _rotation);
 
-    // Wrapping from the last window back to the first travels the whole band,
-    // so give it proportionally longer, up to a limit.
     final steps = ((_rollTo - _rollFrom).abs() / layout.step).clamp(1.0, 100.0);
-    final millis = (rollDuration.inMilliseconds * math.sqrt(steps))
-        .clamp(rollDuration.inMilliseconds, rollDurationMax.inMilliseconds)
+    final base = _settings.rollDuration.inMilliseconds;
+    final millis = (base * math.sqrt(steps))
+        .clamp(base.toDouble(), rollDurationMax.inMilliseconds.toDouble())
         .round();
 
     _roll
@@ -228,8 +315,8 @@ class _SwitcherOverlayState extends State<SwitcherOverlay>
 
   double get _animatedRotation {
     if (!_roll.isAnimating && _roll.value == 0) return _rotation;
-    final eased = Curves.easeOutCubic.transform(_roll.value);
-    final value = _rollFrom + (_rollTo - _rollFrom) * eased;
+    final value = _rollFrom +
+        (_rollTo - _rollFrom) * Curves.easeOutCubic.transform(_roll.value);
     if (!_roll.isAnimating) _rotation = _rollTo;
     return value;
   }
@@ -241,7 +328,8 @@ class _SwitcherOverlayState extends State<SwitcherOverlay>
     int? targetWidth;
     int? targetHeight;
     if (longEdge != null && (shot.width > longEdge || shot.height > longEdge)) {
-      final scale = longEdge / (shot.width > shot.height ? shot.width : shot.height);
+      final scale =
+          longEdge / (shot.width > shot.height ? shot.width : shot.height);
       targetWidth = (shot.width * scale).round();
       targetHeight = (shot.height * scale).round();
     }
@@ -259,6 +347,8 @@ class _SwitcherOverlayState extends State<SwitcherOverlay>
 
   @override
   void dispose() {
+    trayManager.removeListener(this);
+    _settings.removeListener(_onSettingsChanged);
     _keySubscription?.cancel();
     _releaseSubscription?.cancel();
     _roll.dispose();
@@ -268,22 +358,29 @@ class _SwitcherOverlayState extends State<SwitcherOverlay>
 
   @override
   Widget build(BuildContext context) {
-    if (!_open) return const SizedBox.expand();
-
-    return LayoutBuilder(builder: (context, constraints) {
-      _lastSize = Size(constraints.maxWidth, constraints.maxHeight);
-      return CustomPaint(
-        size: _lastSize,
-        painter: SwitcherPainter(
-          backdrop: _backdrop,
-          tiles: _tiles,
-          rotation: _animatedRotation,
-          meridian: _meridian,
-          selected: _selected,
-          globe: widget.globe,
-          when: DateTime.now(),
-        ),
-      );
-    });
+    switch (_mode) {
+      case AppMode.hidden:
+        return const SizedBox.expand();
+      case AppMode.settings:
+        return SettingsPage(
+            settings: _settings, onClose: () => unawaited(_hideSettings()));
+      case AppMode.overlay:
+        return LayoutBuilder(builder: (context, constraints) {
+          _lastSize = Size(constraints.maxWidth, constraints.maxHeight);
+          return CustomPaint(
+            size: _lastSize,
+            painter: SwitcherPainter(
+              backdrop: _backdrop,
+              tiles: _tiles,
+              rotation: _animatedRotation,
+              meridian: _meridian,
+              selected: _selected,
+              globe: widget.globe,
+              when: DateTime.now(),
+              settings: _settings,
+            ),
+          );
+        });
+    }
   }
 }

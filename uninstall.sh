@@ -20,9 +20,12 @@ set -euo pipefail
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/globeswitcher"
 BIN="$HOME/.local/bin/globeswitcher"
 AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/globeswitcher.desktop"
+MENU_ENTRY="${XDG_DATA_HOME:-$HOME/.local/share}/applications/globeswitcher.desktop"
 BACKUP="$DATA_DIR/keybindings-backup.json"
 
-pkill -f "globeswitcher\.__main__" 2>/dev/null || true
+pkill -f "globeswitcher\.__main__" 2>/dev/null || true          # Python daemon
+pkill -f "globeswitcher/app/globeswitcher" 2>/dev/null || true   # Flutter build
+sleep 1
 
 # Give Alt+Tab back to the desktop before deleting the record of what it was.
 if [ -f "$BACKUP" ] && command -v gsettings >/dev/null; then
@@ -39,7 +42,7 @@ for key, value in saved.items():
 PYTHON
 fi
 
-rm -f "$BIN" "$AUTOSTART"
+rm -f "$BIN" "$AUTOSTART" "$MENU_ENTRY"
 rm -rf "$DATA_DIR"
 
 echo "Removed. Alt+Tab is back to your desktop's own switcher."

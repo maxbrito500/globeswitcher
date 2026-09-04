@@ -9,15 +9,10 @@ import 'dart:ui' as ui;
 import 'package:flutter/services.dart';
 
 import '../model/solar.dart';
-import 'ring.dart';
 
 /// Solar elevations bounding the twilight blend, in radians.
 const double twilightLow = -12.0 * 3.14159265358979 / 180.0;
 const double twilightHigh = 6.0 * 3.14159265358979 / 180.0;
-
-/// Daylight left in the night side. City lights alone are so close to black
-/// that half the globe would simply disappear.
-const double nightAmbient = 0.14;
 
 class GlobeShader {
   GlobeShader._(this._program, this.dayTexture, this.nightTexture);
@@ -45,6 +40,8 @@ class GlobeShader {
     required ui.Rect rect,
     required double rotation,
     required DateTime when,
+    required double tilt,
+    required double nightAmbient,
     double opacity = 1.0,
   }) {
     final sun = subsolarPoint(when);
@@ -58,7 +55,7 @@ class GlobeShader {
     setFloat(rect.width);
     setFloat(rect.height);
     setFloat(rotation);
-    setFloat(viewTilt);
+    setFloat(tilt);
     setFloat(sun.latitude);
     setFloat(sun.longitude);
     setFloat(twilightLow);
