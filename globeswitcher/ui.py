@@ -37,9 +37,9 @@ from .globe import VIEW_TILT_RADIANS
 
 # Layout, as fractions of the screen's short axis.
 GLOBE_FRACTION = 0.50
-ITEM_FRACTION = 0.377
-ITEM_MIN = 218
-ITEM_MAX = 494
+ITEM_FRACTION = 0.32
+ITEM_MIN = 185
+ITEM_MAX = 420
 
 # The ring the windows ride on, in globe radii. Wide enough that
 # ORBIT_RADIUS * sin(view tilt) is about 1, which puts the window at the front
@@ -434,12 +434,6 @@ class TileFactory:
         tile = thumbnail.resize((width, tall), Image.LANCZOS).convert("RGBA")
         radius = max(4, int(min(width, tall) * 0.09))
         tile.putalpha(_rounded_mask((width, tall), radius))
-
-        # A hairline edge stops pale window contents dissolving into the
-        # dimmed desktop behind them.
-        ImageDraw.Draw(tile).rounded_rectangle(
-            (0, 0, width - 1, tall - 1), radius=radius,
-            outline=(255, 255, 255, 90), width=2)
 
         icon = self._icons[index]
         if icon is not None:

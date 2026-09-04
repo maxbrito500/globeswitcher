@@ -80,7 +80,9 @@ everything it installed.
 **The map.** `tools/globe-texture` renders a 2048x1024 equirectangular image
 from NASA's *Blue Marble* (day) and *Black Marble* (night lights). Each pixel
 is mixed according to the sun's elevation there, across a smoothstep twilight
-band, so the terminator is a soft edge rather than a hard line. The subsolar
+band, so the terminator is a soft edge rather than a hard line. A trace of
+daylight is left in the night side, because city lights alone are so close to
+black that half the globe would simply disappear. The subsolar
 point comes from the low-precision solar formulas in the *Astronomical
 Almanac* — no network service is involved, only your system clock. The imagery
 is downloaded once and cached; everything after that works offline.
@@ -121,6 +123,14 @@ anything left over falls back to the application icon until the next open.
 Which windows are hidden needs no test for it. The far half is drawn first,
 then the globe, then the near half; because the globe is opaque inside its
 disc, a window crossing the limb is cut exactly at the silhouette.
+
+**Which way it faces.** The map carries the terminator for right now, but a
+globe pinned to the prime meridian shows a dark face all evening while the
+daylight sits round the back. The view is turned to the clock's own offset
+from UTC instead — fifteen degrees of longitude an hour — so you are looking
+at your own part of the world, and can see whether it is still in daylight.
+That offset is added when sampling the map, not to the ring, so the windows
+still line up where they should.
 
 **Rolling.** The selected window is whichever one faces you, so selection and
 rotation are the same thing: pressing Tab picks the next window and sets the
@@ -198,6 +208,7 @@ Constants at the top of the source:
 | `globeswitcher/ui.py` | `BACKDROP_DIM` | How much of the desktop's brightness remains |
 | `globeswitcher/ui.py` | `BADGE_FRACTION` | Size of the application icon on a thumbnail |
 | `tools/globe-texture` | `TWILIGHT_LO` / `TWILIGHT_HI` | Solar elevations bounding the twilight blend |
+| `tools/globe-texture` | `NIGHT_AMBIENT` | Daylight left in the night side so it stays readable |
 
 `(ORBIT_RADIUS · sin(VIEW_TILT_RADIANS) − ORBIT_LIFT · cos(VIEW_TILT_RADIANS))`
 is where the front window sits, in globe radii below the centre. Around 0.65 it

@@ -76,6 +76,22 @@ def shortest_turn(delta):
     return (delta + math.pi) % TWO_PI - math.pi
 
 
+def local_meridian():
+    """The rotation that turns the user's own part of the world to the front.
+
+    The map already carries the terminator for right now, but a globe pinned
+    to the prime meridian shows a dark face all evening while the daylight
+    sits round the back. Facing the viewer's own longitude puts the daylight
+    where they care about it, and shows whether their own part of the world is
+    still in it. Fifteen degrees of longitude an hour, from the clock's own
+    offset from UTC.
+    """
+    local = time.localtime()
+    offset_seconds = -(time.altzone if local.tm_isdst and time.daylight
+                       else time.timezone)
+    return offset_seconds / 3600.0 * (math.pi / 12.0)
+
+
 class WindowEntry:
     __slots__ = ("xid", "title", "icon", "thumbnail")
 
@@ -122,6 +138,11 @@ class Switcher:
         self._roll_to = 0.0
         self._roll_start = 0.0
         self._roll_duration = ROLL_DURATION
+
+        # Added to the ring's rotation when sampling the map, so the geography
+        # on show is set by the clock while the ring still lines up with the
+        # selected window.
+        self._meridian = local_meridian()
 
     # -- key grabs ------------------------------------------------------------
 
@@ -273,6 +294,7 @@ class Switcher:
         if self.generator:
             self.globe.refresh_if_stale(self.generator)
         self.globe.reload_texture()
+        self._meridian = local_meridian()
 
         screen = x11.grab_screen(self.display)
         if screen is None:
@@ -384,7 +406,7 @@ class Switcher:
 
         # render() hands back its own reusable buffer, and returns a blank
         # sphere rather than nothing when the map has not been generated yet.
-        rendered = self.globe.render(self._rotation)
+        rendered = self.globe.render(self._rotation + self._meridian)
 
         block, x, y = self._frame.render(
             self._rotation, self._selected, rendered, self.globe.alpha)

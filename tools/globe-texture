@@ -56,6 +56,12 @@ MAP_SIZE = (2048, 1024)
 TWILIGHT_LO = -12.0
 TWILIGHT_HI = 6.0
 
+# A little daylight mixed into the night side. City lights alone are almost
+# black, and a globe that is half invisible cannot show you where the daylight
+# is: this keeps the dark half readable as the Earth while leaving the
+# terminator obvious.
+NIGHT_AMBIENT = 0.14
+
 DOWNLOAD_TIMEOUT = 120
 
 # --- textures ---------------------------------------------------------------
@@ -149,8 +155,13 @@ def daylight_alpha(shape, when):
 def render(when, size=MAP_SIZE):
     day = texture("day", DAY_URL, size)
     night = texture("night", NIGHT_URL, size)
+
+    # City lights plus a trace of daylight, so the night side still has
+    # coastlines rather than being a black hole.
+    dark = np.clip(night + day * NIGHT_AMBIENT, 0, 255)
+
     alpha = daylight_alpha((size[1], size[0]), when)[:, :, None]
-    blended = day * alpha + night * (1.0 - alpha)
+    blended = day * alpha + dark * (1.0 - alpha)
     return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
 
 
