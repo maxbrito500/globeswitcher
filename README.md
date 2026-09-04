@@ -262,6 +262,23 @@ GLOBESWITCHER_DEBUG=1 ~/.local/bin/globeswitcher
   near the limbs, where the spacing foreshortens. They shrink to compensate,
   but only so far.
 
+## A Flutter port lives alongside this
+
+`flutter_app/` holds a rewrite with Flutter doing the drawing, so the switcher
+can eventually run on more than X11. It works today on Linux, but it is not
+what `install.sh` installs; see `flutter_app/README.md`.
+
+Worth knowing before reaching for it: Flutter ports the drawing and nothing
+else. Listing another application's windows, picturing them, raising one and
+taking over Alt+Tab have no Flutter API and are different on every desktop, so
+each platform still needs its own backend behind one interface. The X11 one is
+written in `dart:ffi` against libX11, with no C plugin, and the same approach
+would work against `user32.dll` on Windows.
+
+One thing the port does better: the globe is a fragment shader that computes
+the solar elevation per pixel, so the terminator is exact on every frame with
+no map to regenerate and nothing to go stale.
+
 ## Credits
 
 Satellite imagery courtesy of [NASA Visible Earth](https://visibleearth.nasa.gov/):
