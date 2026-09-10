@@ -24,6 +24,21 @@ class SwitcherTile {
   final ui.Image? icon;
 }
 
+/// The box a tile is drawn in: the bead's size, in the image's own shape, so
+/// hit-testing and painting agree about where the window is.
+Rect tileRect(Bead bead, ui.Image? image) {
+  if (image == null) {
+    return Rect.fromCenter(
+        center: bead.centre, width: bead.size, height: bead.size);
+  }
+  final scale = math.min(
+      bead.size / image.width.toDouble(), bead.size / image.height.toDouble());
+  return Rect.fromCenter(
+      center: bead.centre,
+      width: image.width * scale,
+      height: image.height * scale);
+}
+
 class SwitcherPainter extends CustomPainter {
   SwitcherPainter({
     required this.backdrop,
@@ -103,12 +118,9 @@ class SwitcherPainter extends CustomPainter {
     if (image == null) return;
 
     // Keep the window's own shape: half of recognising it at a glance.
-    final scale = math.min(
-        bead.size / image.width.toDouble(), bead.size / image.height.toDouble());
-    final width = image.width * scale;
-    final height = image.height * scale;
-    final rect = Rect.fromCenter(
-        center: bead.centre, width: width, height: height);
+    final rect = tileRect(bead, image);
+    final width = rect.width;
+    final height = rect.height;
     final radius = Radius.circular(math.max(4, math.min(width, height) * 0.09));
     final rounded = RRect.fromRectAndRadius(rect, radius);
 

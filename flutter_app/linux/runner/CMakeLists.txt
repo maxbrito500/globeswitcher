@@ -23,4 +23,8 @@ add_definitions(-DAPPLICATION_ID="${APPLICATION_ID}")
 target_link_libraries(${BINARY_NAME} PRIVATE flutter)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::GTK)
 
+# The X error handler is installed from the runner; see my_application.cc.
+pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::X11)
+
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")

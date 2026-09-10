@@ -9,6 +9,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tray_manager/tray_manager.dart';
@@ -35,8 +36,50 @@ const MethodChannel _windowChannel = MethodChannel('globeswitcher/window');
 
 enum AppMode { hidden, overlay, settings }
 
+/// Only one copy may run: two of them fight over the Alt+Tab grab, and the one
+/// that loses simply never sees the key, which looks like the switcher being
+/// broken rather than being doubled.
+Future<bool> _claimSingleInstance() async {
+  final runtime = Platform.environment['XDG_RUNTIME_DIR'] ??
+      Directory.systemTemp.path;
+  final lock = File('$runtime/globeswitcher.lock');
+  try {
+    final handle = await lock.open(mode: FileMode.write);
+    await handle.lock(FileLock.exclusive);
+    return true;                      // held until the process exits
+  } on FileSystemException {
+    return false;
+  }
+}
+
+/// Errors that would otherwise only reach the debug console go to stderr
+/// with a timestamp, which the launcher keeps in a log file. Uncaught ones
+/// are not fatal to the process, but they are the trail leading up to
+/// anything that is.
+void _logErrors() {
+  void log(String what, Object error, StackTrace? stack) {
+    stderr.writeln('${DateTime.now()} $what: $error');
+    if (stack != null) stderr.writeln(stack);
+  }
+
+  FlutterError.onError = (details) {
+    log('flutter error', details.exceptionAsString(), details.stack);
+  };
+  ui.PlatformDispatcher.instance.onError = (error, stack) {
+    log('uncaught error', error, stack);
+    return true;
+  };
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  _logErrors();
+
+  if (!await _claimSingleInstance()) {
+    stderr.writeln('globeswitcher is already running.');
+    exit(0);
+  }
+
   final settings = SwitcherSettings();
   await settings.load();
   final globe = await GlobeShader.load();
@@ -87,6 +130,11 @@ class _SwitcherHomeState extends State<SwitcherHome>
   ui.Image? _backdrop;
 
   AppMode _mode = AppMode.hidden;
+
+  /// Set while the overlay is being built. A release of Alt in that window
+  /// cannot be acted on yet, so it is remembered and applied once it is up.
+  bool _opening = false;
+  bool _releasedWhileOpening = false;
   int _selected = 0;
   double _rotation = 0;
   double _rollFrom = 0;
@@ -113,7 +161,64 @@ class _SwitcherHomeState extends State<SwitcherHome>
       unawaited(_open(backwards: backwards));
     });
     _keySubscription = backend.keys.listen(_onKey);
-    _releaseSubscription = backend.modifiersReleased.listen((_) => _accept());
+    _releaseSubscription = backend.modifiersReleased.listen((_) {
+      if (_opening) {
+        _releasedWhileOpening = true;
+      } else {
+        _accept();
+      }
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) => unawaited(_warmUp()));
+  }
+
+  /// The first switch used to pay for everything at once: compiling the
+  /// globe's shader, uploading two earth maps to the GPU, rasterising the
+  /// title font, decoding a screen-sized picture, and the X round trips for
+  /// every atom. Paint one frame off screen at startup so all of that is done
+  /// before Alt is first pressed.
+  Future<void> _warmUp() async {
+    final backend = _backend;
+    if (backend == null) return;
+    final size =
+        Size(backend.screenWidth.toDouble(), backend.screenHeight.toDouble());
+
+    backend.warmUp();
+
+    final width = size.width.round();
+    final height = size.height.round();
+    final blank = await _decode(
+        WindowShot(Uint8List(width * height * 4), width, height),
+        longEdge: thumbnailLongEdge);
+    final tiles = [
+      for (var i = 0; i < 3; i++)
+        SwitcherTile(title: 'globeswitcher', thumbnail: blank, icon: blank),
+    ];
+
+    final recorder = ui.PictureRecorder();
+    SwitcherPainter(
+      backdrop: blank,
+      tiles: tiles,
+      rotation: 0,
+      meridian: _meridian,
+      selected: 0,
+      globe: widget.globe,
+      when: DateTime.now(),
+      settings: _settings,
+    ).paint(Canvas(recorder), size);
+    final picture = recorder.endRecording();
+
+    try {
+      // Rasterising is what compiles the shader and uploads the textures;
+      // recording alone does neither.
+      final image = await picture.toImage(width, height);
+      image.dispose();
+    } catch (error) {
+      debugPrint('globeswitcher: warm-up frame failed ($error)');
+    } finally {
+      picture.dispose();
+      blank.dispose();
+    }
   }
 
   void _onSettingsChanged() {
@@ -194,9 +299,22 @@ class _SwitcherHomeState extends State<SwitcherHome>
       return;
     }
 
+    if (_opening) return;
+
     final windows = backend.listWindows();
     if (windows.isEmpty) return;
 
+    _opening = true;
+    _releasedWhileOpening = false;
+    try {
+      await _build(backend, windows, backwards: backwards);
+    } finally {
+      _opening = false;
+    }
+  }
+
+  Future<void> _build(X11Backend backend, List<WindowInfo> windows,
+      {required bool backwards}) async {
     final screen = backend.captureScreen();
     final backdrop = screen == null ? null : await _decode(screen);
 
@@ -229,6 +347,14 @@ class _SwitcherHomeState extends State<SwitcherHome>
       return;
     }
     _step(backwards ? -1 : 1);
+
+    // Taking the pictures takes a moment, and a quick Alt+Tab has let go of
+    // Alt by now. That release went to whichever window had focus, not to us,
+    // so ask outright: an overlay left up with nothing held is what looked
+    // like the switcher ignoring Enter and the mouse.
+    if (_releasedWhileOpening || !backend.shortcutModifierHeld) {
+      _accept();
+    }
   }
 
   Future<void> _close() async {
@@ -242,8 +368,9 @@ class _SwitcherHomeState extends State<SwitcherHome>
     await _setMode(AppMode.hidden);
   }
 
-  void _accept() {
+  void _accept({int? index}) {
     if (_mode != AppMode.overlay) return;
+    if (index != null) _selected = index;
     final chosen = _selected < _windows.length ? _windows[_selected] : null;
     unawaited(_close().then((_) {
       if (chosen != null) _backend?.activateWindow(chosen.id);
@@ -257,6 +384,10 @@ class _SwitcherHomeState extends State<SwitcherHome>
         _step(1);
       case SwitcherKey.previous:
         _step(-1);
+      case SwitcherKey.first:
+        _step(-_selected);
+      case SwitcherKey.last:
+        _step(_windows.length - 1 - _selected);
       case SwitcherKey.cancel:
         unawaited(_close());
       case SwitcherKey.accept:
@@ -283,6 +414,39 @@ class _SwitcherHomeState extends State<SwitcherHome>
       _rotation = RingLayout(_lastSize, windows.length, _settings.ringConfig)
           .longitude(_selected);
     });
+  }
+
+  // -- mouse ------------------------------------------------------------------
+
+  RingLayout get _layout =>
+      RingLayout(_lastSize, _windows.length, _settings.ringConfig);
+
+  Bead? _tileAt(Offset point) => _layout.hitTest(
+      point,
+      _animatedRotation,
+      (bead) => tileRect(
+          bead, _tiles[bead.index].thumbnail ?? _tiles[bead.index].icon));
+
+  void _onPointerDown(PointerDownEvent event) {
+    if (_mode != AppMode.overlay || _tiles.isEmpty) return;
+    final bead = _tileAt(event.localPosition);
+    if (bead == null) {
+      // Clicking the desktop behind the ring is how you back out of it.
+      unawaited(_close());
+      return;
+    }
+    if (event.buttons & kMiddleMouseButton != 0) {
+      setState(() => _selected = bead.index);
+      _closeSelected();
+      return;
+    }
+    _accept(index: bead.index);
+  }
+
+  void _onPointerSignal(PointerSignalEvent event) {
+    if (_mode != AppMode.overlay || event is! PointerScrollEvent) return;
+    if (event.scrollDelta.dy == 0) return;
+    _step(event.scrollDelta.dy > 0 ? 1 : -1);
   }
 
   // -- rolling ----------------------------------------------------------------
@@ -367,17 +531,22 @@ class _SwitcherHomeState extends State<SwitcherHome>
       case AppMode.overlay:
         return LayoutBuilder(builder: (context, constraints) {
           _lastSize = Size(constraints.maxWidth, constraints.maxHeight);
-          return CustomPaint(
-            size: _lastSize,
-            painter: SwitcherPainter(
-              backdrop: _backdrop,
-              tiles: _tiles,
-              rotation: _animatedRotation,
-              meridian: _meridian,
-              selected: _selected,
-              globe: widget.globe,
-              when: DateTime.now(),
-              settings: _settings,
+          return Listener(
+            behavior: HitTestBehavior.opaque,
+            onPointerDown: _onPointerDown,
+            onPointerSignal: _onPointerSignal,
+            child: CustomPaint(
+              size: _lastSize,
+              painter: SwitcherPainter(
+                backdrop: _backdrop,
+                tiles: _tiles,
+                rotation: _animatedRotation,
+                meridian: _meridian,
+                selected: _selected,
+                globe: widget.globe,
+                when: DateTime.now(),
+                settings: _settings,
+              ),
             ),
           );
         });

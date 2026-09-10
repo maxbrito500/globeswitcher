@@ -61,10 +61,21 @@ const int xkIsoLeftTab = 0xFE20;
 const int xkEscape = 0xFF1B;
 const int xkAltL = 0xFFE9;
 const int xkAltR = 0xFFEA;
+const int xkMetaL = 0xFFE7;
+const int xkMetaR = 0xFFE8;
+const int xkReturn = 0xFF0D;
+const int xkKpEnter = 0xFF8D;
+const int xkSpace = 0x0020;
 const int xkLeft = 0xFF51;
 const int xkUp = 0xFF52;
 const int xkRight = 0xFF53;
 const int xkDown = 0xFF54;
+const int xkKpLeft = 0xFF96;
+const int xkKpUp = 0xFF97;
+const int xkKpRight = 0xFF98;
+const int xkKpDown = 0xFF99;
+const int xkHome = 0xFF50;
+const int xkEnd = 0xFF57;
 const int xkF4 = 0xFFC1;
 const int xkW = 0x0077;
 const int xkQ = 0x0071;
@@ -357,6 +368,17 @@ final int Function(Pointer<Void>, int) xUngrabKeyboard = _x11.lookupFunction<
     Int32 Function(Pointer<Void>, IntPtr), int Function(Pointer<Void>, int)>(
     'XUngrabKeyboard');
 
+final int Function(Pointer<Void>, int, Pointer<IntPtr>, Pointer<IntPtr>,
+        Pointer<Int32>, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>,
+        Pointer<Uint32>) xQueryPointer =
+    _x11.lookupFunction<
+        Int32 Function(Pointer<Void>, IntPtr, Pointer<IntPtr>, Pointer<IntPtr>,
+            Pointer<Int32>, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>,
+            Pointer<Uint32>),
+        int Function(Pointer<Void>, int, Pointer<IntPtr>, Pointer<IntPtr>,
+            Pointer<Int32>, Pointer<Int32>, Pointer<Int32>, Pointer<Int32>,
+            Pointer<Uint32>)>('XQueryPointer');
+
 final int Function(Pointer<Void>, int, int) xSelectInput = _x11.lookupFunction<
     Int32 Function(Pointer<Void>, IntPtr, IntPtr),
     int Function(Pointer<Void>, int, int)>('XSelectInput');
@@ -377,21 +399,9 @@ final int Function(Pointer<Void>) xFlush =
     _x11.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>(
         'XFlush');
 
-final Pointer<Void> Function(Pointer<NativeFunction<Int32 Function(Pointer<Void>,
-        Pointer<Void>)>>) xSetErrorHandler =
-    _x11.lookupFunction<
-        Pointer<Void> Function(
-            Pointer<NativeFunction<Int32 Function(Pointer<Void>, Pointer<Void>)>>),
-        Pointer<Void> Function(
-            Pointer<NativeFunction<Int32 Function(Pointer<Void>, Pointer<Void>)>>)>(
-        'XSetErrorHandler');
-
-int _swallowError(Pointer<Void> display, Pointer<Void> event) => 0;
-
-/// Windows vanish while a switcher is asking about them; the default handler
-/// would take the process down with them.
-void installErrorHandler() {
-  xSetErrorHandler(
-      Pointer.fromFunction<Int32 Function(Pointer<Void>, Pointer<Void>)>(
-          _swallowError, 0));
-}
+// There is deliberately no XSetErrorHandler binding here. Xlib's error handler
+// is one per process and is called from whatever thread and whatever moment an
+// error comes back in -- GDK's connection, the GL layer, a GTK idle -- and a
+// Dart callback invoked with no Dart frame on the stack aborts the process
+// ("Cannot invoke native callback outside an isolate"). The runner installs a
+// native no-op handler instead; see linux/runner/my_application.cc.

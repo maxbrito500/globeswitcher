@@ -51,7 +51,6 @@ class X11Backend implements WindowBackend {
 
   /// Opens the display, or returns null when there is no X server to talk to.
   static X11Backend? open() {
-    installErrorHandler();
     final display = xOpenDisplay(nullptr);
     if (display == nullptr) return null;
 
@@ -400,11 +399,56 @@ class X11Backend implements WindowBackend {
   }
 
   @override
+  bool get shortcutModifierHeld {
+    final root = calloc<IntPtr>();
+    final child = calloc<IntPtr>();
+    final coords = calloc<Int32>(4);
+    final mask = calloc<Uint32>();
+    try {
+      xQueryPointer(_display, _root, root, child, coords, coords + 1,
+          coords + 2, coords + 3, mask);
+      return mask.value & mod1Mask != 0;
+    } finally {
+      calloc.free(root);
+      calloc.free(child);
+      calloc.free(coords);
+      calloc.free(mask);
+    }
+  }
+
+  @override
   void releaseKeyboard() {
     if (!_keyboardHeld) return;
     xUngrabKeyboard(_display, 0);
     xFlush(_display);
     _keyboardHeld = false;
+  }
+
+  // -- warm-up ----------------------------------------------------------------
+
+  /// Everything the first switch would otherwise wait for: each atom is a
+  /// round trip the first time it is asked for, and the first XGetImage of a
+  /// whole screen pays for its buffers.
+  void warmUp() {
+    for (final name in const [
+      '_NET_CLIENT_LIST_STACKING',
+      '_NET_CLIENT_LIST',
+      '_NET_ACTIVE_WINDOW',
+      '_NET_WM_STATE',
+      '_NET_WM_STATE_SKIP_TASKBAR',
+      '_NET_WM_WINDOW_TYPE',
+      '_NET_WM_DESKTOP',
+      '_NET_CURRENT_DESKTOP',
+      '_NET_WM_NAME',
+      'WM_NAME',
+      '_NET_WM_ICON',
+      '_NET_CLOSE_WINDOW',
+      ..._skippedTypes,
+    ]) {
+      _atom(name);
+    }
+    listWindows();
+    captureScreen();
   }
 
   // -- event pump -------------------------------------------------------------
@@ -430,7 +474,11 @@ class X11Backend implements WindowBackend {
 
   void _onKeyPress(XKeyEvent key) {
     final backwards = key.state & shiftMask != 0;
-    final symbol = xKeycodeToKeysym(_display, key.keycode, backwards ? 1 : 0);
+
+    // Always read the unshifted symbol. Arrows and friends have no shifted
+    // one, so looking them up at the shift level answers NoSymbol and the key
+    // is lost whenever Shift is still down after a Shift+Alt+Tab.
+    final symbol = xKeycodeToKeysym(_display, key.keycode, 0);
 
     if (symbol == xkTab || symbol == xkIsoLeftTab) {
       if (_keyboardHeld) {
@@ -445,12 +493,24 @@ class X11Backend implements WindowBackend {
     switch (symbol) {
       case xkEscape:
         _keys.add(SwitcherKey.cancel);
+      case xkReturn:
+      case xkKpEnter:
+      case xkSpace:
+        _keys.add(SwitcherKey.accept);
       case xkRight:
       case xkDown:
+      case xkKpRight:
+      case xkKpDown:
         _keys.add(SwitcherKey.next);
       case xkLeft:
       case xkUp:
+      case xkKpLeft:
+      case xkKpUp:
         _keys.add(SwitcherKey.previous);
+      case xkHome:
+        _keys.add(SwitcherKey.first);
+      case xkEnd:
+        _keys.add(SwitcherKey.last);
       case xkW:
       case xkQ:
       case xkF4:
@@ -461,7 +521,12 @@ class X11Backend implements WindowBackend {
   void _onKeyRelease(XKeyEvent key) {
     if (!_keyboardHeld) return;
     final symbol = xKeycodeToKeysym(_display, key.keycode, 0);
-    if (symbol == xkAltL || symbol == xkAltR) _released.add(null);
+    if (symbol == xkAltL ||
+        symbol == xkAltR ||
+        symbol == xkMetaL ||
+        symbol == xkMetaR) {
+      _released.add(null);
+    }
   }
 
   @override

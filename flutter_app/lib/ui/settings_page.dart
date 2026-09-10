@@ -55,32 +55,61 @@ class _SwitcherTab extends StatelessWidget {
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: settings,
-      builder: (context, _) => ListView(
-        padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
+      builder: (context, _) => LayoutBuilder(builder: (context, constraints) {
+        // Two columns as soon as there is room: nine sliders in one column is
+        // a scrolling list, and the point of a settings panel is to see the
+        // dials next to each other.
+        const spacing = 28.0;
+        final columns = constraints.maxWidth >= 860 ? 2 : 1;
+        final columnWidth =
+            (constraints.maxWidth - 48 - spacing * (columns - 1)) / columns;
+
+        return ListView(
+        padding: const EdgeInsets.fromLTRB(24, 16, 24, 20),
         children: [
           Text('Changes take effect the next time you press Alt+Tab.',
-              style: Theme.of(context).textTheme.bodySmall),
-          const SizedBox(height: 12),
-          for (final tunable in switcherTunables)
-            _TunableSlider(settings: settings, tunable: tunable),
-          const Divider(height: 32),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            value: settings.currentWorkspaceOnly,
-            onChanged: settings.setCurrentWorkspaceOnly,
-            title: const Text('Only this workspace'),
-            subtitle: const Text(
-                'Leave off to switch to windows on every workspace.'),
+              style: Theme.of(context).textTheme.bodyMedium),
+          const SizedBox(height: 16),
+          Wrap(
+            spacing: spacing,
+            runSpacing: 4,
+            children: [
+              for (final tunable in switcherTunables)
+                SizedBox(
+                  width: columnWidth,
+                  child: _TunableSlider(settings: settings, tunable: tunable),
+                ),
+            ],
           ),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            value: settings.showTitles,
-            onChanged: settings.setShowTitles,
-            title: const Text('Show the window title'),
-            subtitle: const Text(
-                'The title of the window at the front, under the globe.'),
+          const Divider(height: 28),
+          Wrap(
+            spacing: spacing,
+            children: [
+              SizedBox(
+                width: columnWidth,
+                child: SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: settings.currentWorkspaceOnly,
+                  onChanged: settings.setCurrentWorkspaceOnly,
+                  title: const Text('Only this workspace'),
+                  subtitle: const Text(
+                      'Leave off to switch to windows on every workspace.'),
+                ),
+              ),
+              SizedBox(
+                width: columnWidth,
+                child: SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: settings.showTitles,
+                  onChanged: settings.setShowTitles,
+                  title: const Text('Show the window title'),
+                  subtitle: const Text(
+                      'The title of the window at the front, under the globe.'),
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           Align(
             alignment: Alignment.centerLeft,
             child: OutlinedButton.icon(
@@ -90,7 +119,8 @@ class _SwitcherTab extends StatelessWidget {
             ),
           ),
         ],
-      ),
+        );
+      }),
     );
   }
 }
@@ -112,7 +142,7 @@ class _TunableSlider extends StatelessWidget {
         : '${value.toStringAsFixed(tunable.unit == 'ms' ? 0 : 2)}${tunable.unit}';
 
     return Padding(
-      padding: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.only(bottom: 13),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -120,8 +150,10 @@ class _TunableSlider extends StatelessWidget {
             children: [
               Expanded(
                   child: Text(tunable.label,
-                      style: theme.textTheme.titleSmall)),
-              Text(shown, style: theme.textTheme.bodyMedium),
+                      style: theme.textTheme.titleMedium)),
+              Text(shown,
+                  style: theme.textTheme.titleMedium
+                      ?.copyWith(color: theme.colorScheme.primary)),
             ],
           ),
           Slider(
@@ -130,7 +162,7 @@ class _TunableSlider extends StatelessWidget {
             max: tunable.max,
             onChanged: (next) => settings.set(tunable.key, next),
           ),
-          Text(tunable.help, style: theme.textTheme.bodySmall),
+          Text(tunable.help, style: theme.textTheme.bodyMedium),
         ],
       ),
     );

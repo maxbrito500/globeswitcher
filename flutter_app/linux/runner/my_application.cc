@@ -2,6 +2,7 @@
 
 #include <flutter_linux/flutter_linux.h>
 #ifdef GDK_WINDOWING_X11
+#include <X11/Xlib.h>
 #include <gdk/gdkx.h>
 #endif
 
@@ -24,24 +25,94 @@ G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
 // screen before Alt is pressed would be in the way of everything.
 static void first_frame_cb(MyApplication* self, FlView* view) {}
 
+#ifdef GDK_WINDOWING_X11
+// Windows vanish while the switcher is asking about them, and GDK's handler
+// treats any X error as fatal. The handler is process-wide and Xlib calls it
+// from whatever thread the error arrives on, which is why it lives here in C
+// rather than in Dart: a Dart callback reached with no Dart frame on the
+// stack takes the whole process down.
+static int swallow_x_error(Display* display, XErrorEvent* error) {
+  return 0;
+}
+#endif
+
 // The one window wears two hats. As the switcher it is an undecorated
 // fullscreen overlay above everything; as the settings panel it is an ordinary
 // window with a title bar. Flutter desktop gives an application a single
 // window, so it is reconfigured rather than duplicated.
+// The monitor the window is on, falling back to the first one.
+static GdkMonitor* window_monitor(GtkWindow* window) {
+  GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(window));
+  GdkMonitor* monitor = gdk_display_get_primary_monitor(display);
+  if (monitor == nullptr && gdk_display_get_n_monitors(display) > 0) {
+    monitor = gdk_display_get_monitor(display, 0);
+  }
+  return monitor;
+}
+
 static void apply_overlay_mode(GtkWindow* window) {
   gtk_widget_hide(GTK_WIDGET(window));
   gtk_window_set_decorated(window, FALSE);
-  gtk_window_set_resizable(window, FALSE);
+
+  // Resizable has to stay on. Marking the window fixed-size tells the window
+  // manager it has a size of its own, and fullscreen is then only partly
+  // honoured: coming back from the settings panel the overlay kept the
+  // panel's width and covered half the screen.
+  gtk_window_set_resizable(window, TRUE);
   gtk_window_set_skip_taskbar_hint(window, TRUE);
   gtk_window_set_skip_pager_hint(window, TRUE);
   gtk_window_set_keep_above(window, TRUE);
   gtk_window_set_type_hint(window, GDK_WINDOW_TYPE_HINT_SPLASHSCREEN);
+
+  // Ask for fullscreen, but do not depend on it. A window manager is within
+  // its rights to refuse fullscreen for a splash-hinted window, and when it
+  // does the overlay keeps whatever size it had -- which showed up as the
+  // switcher covering only part of the screen. Setting the monitor's own
+  // geometry makes the coverage true either way.
+  GdkMonitor* monitor = window_monitor(window);
+  if (monitor != nullptr) {
+    GdkRectangle area;
+    gdk_monitor_get_geometry(monitor, &area);
+    gtk_window_move(window, area.x, area.y);
+    gtk_window_resize(window, area.width, area.height);
+  }
   gtk_window_fullscreen(window);
   gtk_widget_show(GTK_WIDGET(window));
   gtk_window_present(window);
 }
 
+
+// Sized from the screen rather than fixed: a panel of sliders wants room, and
+// a size that suits a laptop leaves a desktop monitor looking half empty.
+static void settings_size(GtkWindow* window, int* width, int* height) {
+  GdkRectangle area = {0, 0, 1280, 800};
+  GdkMonitor* monitor = window_monitor(window);
+  if (monitor != nullptr) {
+    gdk_monitor_get_workarea(monitor, &area);
+  }
+
+  *width = CLAMP((int)(area.width * 0.66), 900, 1500);
+  *height = CLAMP((int)(area.height * 0.86), 700, 1150);
+}
+
+// Leaving fullscreen is asynchronous, so a resize issued in the same breath is
+// applied and then undone by the window manager finishing the unfullscreen --
+// which left the settings panel filling the screen. Doing it once more after
+// the window is up settles it at the size actually asked for.
+static gboolean settle_settings_size(gpointer data) {
+  GtkWindow* window = GTK_WINDOW(data);
+  int width = 0;
+  int height = 0;
+  settings_size(window, &width, &height);
+  gtk_window_resize(window, width, height);
+  return G_SOURCE_REMOVE;
+}
+
 static void apply_settings_mode(GtkWindow* window) {
+  int width = 0;
+  int height = 0;
+  settings_size(window, &width, &height);
+
   gtk_widget_hide(GTK_WIDGET(window));
   gtk_window_unfullscreen(window);
   gtk_window_set_keep_above(window, FALSE);
@@ -50,11 +121,12 @@ static void apply_settings_mode(GtkWindow* window) {
   gtk_window_set_skip_pager_hint(window, FALSE);
   gtk_window_set_decorated(window, TRUE);
   gtk_window_set_resizable(window, TRUE);
-  gtk_window_set_default_size(window, 760, 820);
-  gtk_window_resize(window, 760, 820);
+  gtk_window_set_default_size(window, width, height);
+  gtk_window_resize(window, width, height);
   gtk_window_set_position(window, GTK_WIN_POS_CENTER);
   gtk_widget_show(GTK_WIDGET(window));
   gtk_window_present(window);
+  g_timeout_add(80, settle_settings_size, window);
 }
 
 static void window_method_call_cb(FlMethodChannel* channel,
@@ -102,6 +174,12 @@ static void my_application_activate(GApplication* application) {
   // If running on Wayland assume the header bar will work (may need changing
   // if future cases occur).
   self->window = window;
+
+#ifdef GDK_WINDOWING_X11
+  if (GDK_IS_X11_DISPLAY(gtk_widget_get_display(GTK_WIDGET(window)))) {
+    XSetErrorHandler(swallow_x_error);
+  }
+#endif
 
   // No decoration, no taskbar entry, no pager entry, always on top, and the
   // size of the screen: an overlay rather than a window.

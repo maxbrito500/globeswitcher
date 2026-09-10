@@ -26,10 +26,15 @@ same on Xfce, KDE on X11, i3 or a bare window manager.
 |---|---|
 | `Alt+Tab` | open the switcher and roll the next window to the front |
 | `Shift+Alt+Tab` | open backwards, roll the other way |
-| `→` `↓` / `←` `↑` | keep rolling while it is open |
-| release `Alt` | activate the window at the front |
+| `→` `↓` / `←` `↑` | keep rolling while it is open (keypad arrows too) |
+| `Home` / `End` | jump to the first or last window |
+| release `Alt`, `Enter` or `Space` | activate the window at the front |
 | `Escape` | close without switching |
 | `w`, `q` or `F4` | close the window at the front |
+| click a window | activate it |
+| middle-click a window | close it |
+| scroll wheel | keep rolling |
+| click the backdrop | close without switching |
 
 Windows are offered in most-recently-used order, so a single Alt+Tab flips
 between the last two windows, the way every other switcher behaves.
@@ -76,6 +81,16 @@ X11 only lets one program grab a given key, so whatever your desktop has bound
 to Alt+Tab has to let go of it first. On GNOME the installer does that for you
 and saves the old value; on other desktops, clear Alt+Tab in your keyboard
 settings yourself.
+
+## If it dies
+
+Every start, exit and crash is written to
+`~/.local/share/globeswitcher/globeswitcher.log`, along with whatever the app
+printed before it went. Look there first:
+
+```sh
+tail -50 ~/.local/share/globeswitcher/globeswitcher.log
+```
 
 ## Uninstall
 

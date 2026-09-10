@@ -38,6 +38,10 @@ const double defaultAngularStep = 22.0 * math.pi / 180.0;
 const double depthScale = 0.18;
 const double backOpacity = 0.55;
 
+/// How much bigger the window at the front is than its neighbours: the size
+/// difference is what says "this one" before the highlight is even noticed.
+const double frontScale = 0.20;
+
 /// The dials that decide how the ring looks. Defaults are the constants
 /// above; the settings panel hands in the user's own.
 class RingConfig {
@@ -126,11 +130,17 @@ class RingLayout {
       final ny = cosTilt * config.orbitLift - sinTilt * mz;
       final nz = sinTilt * config.orbitLift + cosTilt * mz;
 
+      // Blended in by how close the window is to the front, so it swells as
+      // it arrives instead of snapping the moment the selection changes.
+      final emphasis = (1.0 - shortestTurn(lon).abs() / step).clamp(0.0, 1.0);
+
       result.add(Bead(
         index,
         Offset(centre.dx + mx * globeRadius, centre.dy - ny * globeRadius),
         nz,
-        itemSize * (1.0 + depthScale * nz / config.orbitRadius),
+        itemSize *
+            (1.0 + depthScale * nz / config.orbitRadius) *
+            (1.0 + frontScale * emphasis),
         nz >= 0 ? 1.0 : backOpacity,
       ));
     }
@@ -139,12 +149,28 @@ class RingLayout {
     return result;
   }
 
+  /// The window under a point, nearest first so a tile in front wins over the
+  /// one it overlaps. [extent] gives each tile's drawn box from its bead.
+  Bead? hitTest(Offset point, double rotation, Rect Function(Bead) extent) {
+    for (final bead in beads(rotation).reversed) {
+      if (extent(bead).contains(point)) return bead;
+    }
+    return null;
+  }
+
   /// Where the title plate sits: below the globe and below the ring.
   double get titleTop {
     final rise = (config.orbitRadius * math.sin(config.viewTilt) -
             config.orbitLift * math.cos(config.viewTilt)) *
         globeRadius;
-    return centre.dy + math.max(globeRadius, rise + itemSize * 0.60) + 16;
+    // The front tile is the nearest and the emphasised one, so it is the
+    // largest on the ring; the plate has to clear it.
+    final nearest = math.sin(config.viewTilt) * config.orbitLift +
+        math.cos(config.viewTilt) * config.orbitRadius;
+    final front = itemSize *
+        (1.0 + depthScale * nearest / config.orbitRadius) *
+        (1.0 + frontScale);
+    return centre.dy + math.max(globeRadius, rise + front * 0.5) + 16;
   }
 }
 

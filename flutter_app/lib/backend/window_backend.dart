@@ -55,7 +55,7 @@ class WindowShot {
 }
 
 /// What the user did while the switcher was open.
-enum SwitcherKey { next, previous, cancel, accept, closeWindow }
+enum SwitcherKey { next, previous, first, last, cancel, accept, closeWindow }
 
 abstract class WindowBackend {
   /// Whether this backend can run here at all.
@@ -94,6 +94,11 @@ abstract class WindowBackend {
   /// Fires when every modifier has been let go, which is the moment a
   /// hold-to-browse switcher commits to its selection.
   Stream<void> get modifiersReleased;
+
+  /// Whether the shortcut's modifier (Alt) is down right now. Asked once the
+  /// switcher is up: a quick tap can let go of Alt before the overlay has
+  /// finished taking its pictures, and that release is never delivered.
+  bool get shortcutModifierHeld;
 
   void dispose();
 }
